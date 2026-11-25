@@ -1,0 +1,70 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+  <meta name="theme-color" content="#07111f"><meta name="description" content="UniversalAI MT5 account monitor">
+  <link rel="manifest" href="/manifest.webmanifest"><link rel="icon" href="/icon.svg" type="image/svg+xml">
+  <title>UniversalAI | Trading Console</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root{color-scheme:dark}body{background:radial-gradient(ellipse at 15% -10%,#123251 0,transparent 45%),#07111f;font-family:Inter,ui-sans-serif,system-ui,sans-serif}.glass{background:rgba(15,29,47,.82);border:1px solid rgba(148,163,184,.14);backdrop-filter:blur(16px)}input,select{background:#0a1727!important}button{touch-action:manipulation}.safe{padding-bottom:max(1.5rem,env(safe-area-inset-bottom))}
+  </style>
+</head>
+<body class="min-h-screen text-slate-100 safe">
+  <div id="pinGate" class="fixed inset-0 z-20 grid place-items-center bg-[#07111f] p-6">
+    <form id="pinForm" class="glass w-full max-w-sm rounded-3xl p-7 shadow-2xl">
+      <div class="mb-6 text-xs font-semibold uppercase tracking-[.24em] text-cyan-300">UniversalAI · Secure access</div>
+      <h1 class="text-2xl font-semibold">Trading console</h1><p class="mt-2 text-sm text-slate-400">Enter the dashboard PIN configured on the server.</p>
+      <input id="pinInput" type="password" inputmode="numeric" autocomplete="current-password" maxlength="64" required class="mt-5 w-full rounded-xl border border-slate-700 px-4 py-3 outline-none focus:border-cyan-400" placeholder="Dashboard PIN">
+      <button class="mt-4 w-full rounded-xl bg-cyan-400 px-4 py-3 font-bold text-slate-950">Unlock</button><p id="pinError" class="mt-3 hidden text-sm text-rose-300"></p>
+    </form>
+  </div>
+  <main class="mx-auto max-w-5xl px-4 py-6 sm:px-6 sm:py-10">
+    <header class="flex items-center justify-between gap-4">
+      <div><p class="text-xs font-semibold uppercase tracking-[.24em] text-cyan-300">Independent MT5 control plane</p><h1 class="mt-2 text-2xl font-semibold tracking-tight sm:text-3xl">UniversalAI</h1><p class="mt-1 text-sm text-slate-400">Signals · risk status · account controls</p></div>
+      <div id="apiStatus" class="flex items-center gap-2 rounded-full border border-slate-700 bg-slate-900/60 px-3 py-2 text-xs text-slate-300"><span class="h-2 w-2 rounded-full bg-slate-500"></span>Connecting</div>
+    </header>
+    <section class="mt-6 grid gap-4 md:grid-cols-[1.1fr_.9fr]">
+      <article class="glass rounded-3xl p-5 sm:p-6">
+        <div class="flex items-center justify-between"><h2 class="font-semibold">Account</h2><button id="refresh" class="text-sm text-cyan-300">Refresh</button></div>
+        <label class="mt-5 block text-xs text-slate-400">Select account</label><select id="accountSelect" class="mt-2 w-full rounded-xl border border-slate-700 px-3 py-3"></select>
+        <div class="mt-4 grid grid-cols-2 gap-3"><div class="rounded-2xl bg-slate-950/50 p-4"><div class="text-xs text-slate-400">Balance</div><div id="balance" class="mt-2 text-lg font-semibold">—</div></div><div class="rounded-2xl bg-slate-950/50 p-4"><div class="text-xs text-slate-400">Equity</div><div id="equity" class="mt-2 text-lg font-semibold">—</div></div></div>
+        <div class="mt-4 flex items-center justify-between rounded-2xl bg-slate-950/50 p-4"><div><div class="text-xs text-slate-400">Engine state</div><div id="state" class="mt-1 font-semibold">No account selected</div></div><button id="toggle" disabled class="rounded-xl bg-emerald-400 px-4 py-3 text-sm font-bold text-slate-950 disabled:opacity-40">START</button></div>
+        <p class="mt-3 text-xs leading-5 text-slate-500">Start enables signal delivery to the EA. Orders still require the EA attached to a chart and AutoTrading enabled.</p>
+      </article>
+      <article class="glass rounded-3xl p-5 sm:p-6">
+        <h2 class="font-semibold">Configure account</h2>
+        <form id="accountForm" class="mt-4 grid grid-cols-2 gap-3">
+          <label class="col-span-2 text-xs text-slate-400">MT5 Account ID<input name="account_id" required maxlength="40" class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3" placeholder="e.g. 12345678"></label>
+          <label class="col-span-2 text-xs text-slate-400">Broker server<input name="broker_server" required maxlength="120" class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3" placeholder="Broker-Live"></label>
+          <label class="text-xs text-slate-400">Account type<select name="account_type" class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3"><option value="broker">Personal broker</option><option value="prop">Prop firm</option></select></label>
+          <label class="text-xs text-slate-400">Risk / trade (%)<input name="risk_pct" type="number" min="0.01" max="5" step="0.01" value="0.5" required class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3"></label>
+          <label class="text-xs text-slate-400">Max daily DD (%)<input name="max_daily_dd_pct" type="number" min="0.1" max="100" step="0.1" value="5" required class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3"></label>
+          <label class="text-xs text-slate-400">Max total DD (%)<input name="max_total_dd_pct" type="number" min="0.1" max="100" step="0.1" value="10" required class="mt-1 w-full rounded-xl border border-slate-700 px-3 py-3"></label>
+          <button class="col-span-2 mt-1 rounded-xl border border-cyan-400/40 bg-cyan-400/10 px-4 py-3 font-semibold text-cyan-200">Save account settings</button>
+        </form><p id="formMessage" class="mt-3 min-h-5 text-sm text-slate-400"></p>
+      </article>
+    </section>
+    <section class="glass mt-4 rounded-3xl p-5 sm:p-6">
+      <div class="flex items-center justify-between"><div><h2 class="font-semibold">Decision feed</h2><p class="mt-1 text-xs text-slate-400">Recent qualified signals and model decisions</p></div><span class="text-xs text-slate-500">Auto refresh · 5 sec</span></div>
+      <div id="feed" class="mt-4 space-y-3"><p class="py-5 text-center text-sm text-slate-500">Choose an account to view its feed.</p></div>
+    </section>
+    <footer class="mt-6 text-center text-xs leading-5 text-slate-600">Trading involves substantial risk. Backtest results do not predict live results. Keep this server on a trusted network and use HTTPS when exposed beyond localhost.</footer>
+  </main>
+<script>
+const gate=document.querySelector('#pinGate'),pinInput=document.querySelector('#pinInput'),pinError=document.querySelector('#pinError');let pin=sessionStorage.getItem('uai_pin')||'';let accounts=[];
+if('serviceWorker' in navigator)navigator.serviceWorker.register('/sw.js').catch(()=>{});
+const headers=()=>({'Content-Type':'application/json','X-Dashboard-PIN':pin});
+async function api(url,opts={}){const r=await fetch(url,{...opts,headers:{...headers(),...(opts.headers||{})}});if(r.status===401){sessionStorage.removeItem('uai_pin');pin='';gate.classList.remove('hidden');throw Error('Invalid dashboard PIN');}if(!r.ok){let x={};try{x=await r.json()}catch{}throw Error(x.detail||`HTTP ${r.status}`)}return r.status===204?null:r.json()}
+document.querySelector('#pinForm').addEventListener('submit',async e=>{e.preventDefault();pin=pinInput.value;try{await api('/api/accounts');sessionStorage.setItem('uai_pin',pin);gate.classList.add('hidden');pinError.classList.add('hidden');refreshAll()}catch(err){pinError.textContent=err.message;pinError.classList.remove('hidden')}});
+async function refreshAccounts(){accounts=await api('/api/accounts');const sel=document.querySelector('#accountSelect'),prev=sel.value;sel.innerHTML='<option value="">Select an account</option>'+accounts.map(a=>`<option value="${esc(a.account_id)}">${esc(a.account_id)} · ${esc(a.broker_server)}</option>`).join('');if(accounts.some(a=>a.account_id===prev))sel.value=prev;else if(accounts.length===1)sel.value=accounts[0].account_id;document.querySelector('#toggle').disabled=!sel.value;}
+function esc(s){return String(s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
+async function refreshDetail(){const id=document.querySelector('#accountSelect').value;document.querySelector('#toggle').disabled=!id;if(!id){document.querySelector('#state').textContent='No account selected';return}const [s,logs]=await Promise.all([api(`/api/accounts/${encodeURIComponent(id)}/status`),api(`/api/logs/${encodeURIComponent(id)}?limit=30`)]);document.querySelector('#balance').textContent=Number(s.state.balance||0).toFixed(2);document.querySelector('#equity').textContent=Number(s.state.equity||0).toFixed(2);const active=!!s.account.active;document.querySelector('#state').innerHTML=`<span class="${active?'text-emerald-300':'text-slate-300'}">${active?'Running':'Stopped'}</span> <span class="text-xs text-slate-500">· ${esc(s.account.account_type)} · risk ${Number(s.account.risk_pct)}%</span>`;const b=document.querySelector('#toggle');b.textContent=active?'STOP':'START';b.className=`rounded-xl px-4 py-3 text-sm font-bold text-slate-950 ${active?'bg-rose-400':'bg-emerald-400'}`;document.querySelector('#feed').innerHTML=logs.length?logs.map(x=>`<article class="rounded-2xl border border-slate-800 bg-slate-950/40 p-4"><div class="flex justify-between gap-3"><strong class="${x.decision==='BUY'?'text-emerald-300':x.decision==='SELL'?'text-rose-300':'text-slate-300'}">${esc(x.decision)} · ${esc(x.symbol)}</strong><span class="text-xs text-slate-500">${esc(x.created_at)}</span></div><p class="mt-2 text-sm text-slate-300">${esc(x.reason||'No additional reason')}</p><p class="mt-2 text-xs text-slate-500">Confidence ${(Number(x.confidence)*100).toFixed(0)}%</p></article>`).join(''):'<p class="py-5 text-center text-sm text-slate-500">No decisions yet. The engine records a decision when an EA polls an active account.</p>'}
+async function refreshAll(){try{document.querySelector('#apiStatus').innerHTML='<span class="h-2 w-2 rounded-full bg-emerald-400"></span>Connected';await refreshAccounts();await refreshDetail()}catch(e){document.querySelector('#apiStatus').innerHTML='<span class="h-2 w-2 rounded-full bg-rose-400"></span>Offline';document.querySelector('#formMessage').textContent=e.message}}
+document.querySelector('#accountForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget),data=Object.fromEntries(f);for(const k of ['risk_pct','max_daily_dd_pct','max_total_dd_pct'])data[k]=Number(data[k]);data.active=false;data.daily_start_balance=0;try{await api('/api/accounts',{method:'POST',body:JSON.stringify(data)});document.querySelector('#formMessage').textContent='Settings saved. Account starts stopped.';e.currentTarget.reset();await refreshAll();document.querySelector('#accountSelect').value=data.account_id;await refreshDetail()}catch(err){document.querySelector('#formMessage').textContent=err.message}});
+document.querySelector('#toggle').addEventListener('click',async()=>{const id=document.querySelector('#accountSelect').value,a=accounts.find(x=>x.account_id===id);if(!a)return;try{await api(`/api/accounts/${encodeURIComponent(id)}/toggle?active=${!a.active}`,{method:'POST'});await refreshAll()}catch(e){document.querySelector('#formMessage').textContent=e.message}});
+document.querySelector('#accountSelect').addEventListener('change',refreshDetail);document.querySelector('#refresh').addEventListener('click',refreshAll);
+if(pin){pinInput.value=pin;api('/api/accounts').then(()=>{gate.classList.add('hidden');refreshAll()}).catch(()=>{sessionStorage.removeItem('uai_pin');pin=''})}
+setInterval(()=>{if(pin&&!gate.classList.contains('hidden'))return;if(pin)refreshAll()},5000);
+</script>
+</body></html>

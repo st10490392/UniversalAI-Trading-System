@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+.pytest_cache/
+*.py[cod]
+.env
+accounts.db
+accounts.db-shm
+accounts.db-wal
+*.ex5
+*.log
+trades.csv
