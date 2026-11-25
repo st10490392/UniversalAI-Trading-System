@@ -9,3 +9,5 @@ accounts.db-wal
 *.ex5
 *.log
 trades.csv
+data/historical_12m/
+logs/

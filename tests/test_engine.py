@@ -3,7 +3,7 @@ import pandas as pd
 import pytest
 
 import brain
-from backtest import _resample_h1, run_backtest
+from backtest import _resample_h1, _walk_exit, run_backtest
 
 
 def test_quant_gate_and_directional_z_filter():
@@ -55,24 +55,47 @@ def test_m15_export_times_resample_to_completed_h1_bars():
     assert hourly.iloc[0].close==13
 
 
-def test_api_account_lifecycle_and_pin(monkeypatch,tmp_path):
+def test_api_license_binding_admin_and_immediate_poll_revoke(monkeypatch,tmp_path):
     from fastapi.testclient import TestClient
     monkeypatch.setattr(brain,"DB_PATH",tmp_path/"accounts.db")
-    monkeypatch.setenv("DASHBOARD_PIN","2468")
+    monkeypatch.setenv("ADMIN_PIN","admin-test-pin")
     brain.init_db()
     client=TestClient(brain.app)
     assert client.get("/manifest.webmanifest").status_code==200
     assert client.get("/sw.js").status_code==200
     assert client.get("/icon.svg").status_code==200
-    data={"account_id":"123","broker_server":"Demo","account_type":"broker","risk_pct":.5,"max_daily_dd_pct":5,"max_total_dd_pct":10}
-    assert client.post("/api/accounts",json=data).status_code==401
-    headers={"X-Dashboard-PIN":"2468"}
+    admin={"X-Admin-PIN":"admin-test-pin"}
+    assert client.get("/api/admin/licenses").status_code==401
+    created=client.post("/api/admin/licenses/create",json={"owner_name":"Demo test"},headers=admin)
+    assert created.status_code==200
+    key=created.json()["license_key"]
+    activation={"license_key":key,"account_id":"123","device_id":"device-uuid-001"}
+    assert client.post("/api/activate",json=activation).status_code==200
+    assert client.post("/api/activate",json={**activation,"device_id":"device-uuid-002"}).status_code==403
+    assert client.post("/api/activate",json={**activation,"account_id":"456"}).status_code==403
+    headers={"X-License-Key":key,"X-License-Account-ID":"123","X-Device-ID":"device-uuid-001"}
+    data={"account_id":"123","broker_server":"Demo","account_type":"broker","risk_pct":1.0,"max_daily_dd_pct":4.0,"max_total_dd_pct":10,"active":True}
     assert client.post("/api/accounts",json=data,headers=headers).status_code==200
-    poll=client.get("/api/ea/poll/123/EURUSD?balance=10000&equity=9900")
+    assert client.get("/api/accounts/123/status",headers={**headers,"X-Device-ID":"device-uuid-002"}).status_code==403
+    license_row=client.get("/api/admin/licenses",headers=admin).json()[0]
+    assert license_row["bound_account_id"]=="123" and license_row["bound_device_id"]=="device-uuid-001"
+    monkeypatch.setattr(brain,"analyze_symbol",lambda *args,**kwargs:None)
+    poll=client.get("/api/ea/poll/123/EURUSD?balance=10000&equity=9900",headers={"X-License-Key":key})
     assert poll.status_code==200 and poll.json()["decision"]=="WAIT"
-    assert poll.json()["max_daily_dd_pct"]==5
-    assert client.post("/api/accounts/123/toggle?active=true",headers=headers).status_code==200
+    assert poll.json()["max_daily_dd_pct"]==4
     assert client.get("/api/accounts/123/status",headers=headers).json()["account"]["active"]==1
+    assert client.post(f"/api/admin/licenses/{key}/toggle",json={"is_active":False},headers=admin).status_code==200
+    assert client.get("/api/ea/poll/123/EURUSD",headers={"X-License-Key":key}).json()=={"command":"UNAUTHORIZED"}
+
+
+def test_quant_and_bias_series_latest_match_single_bar_functions():
+    n=300;x=np.arange(n);close=100+x*.01+np.sin(x/3)
+    d=pd.DataFrame({"open":close,"high":close+.3,"low":close-.3,"close":close})
+    series=brain.quant_metrics_series(d).iloc[-1]
+    latest=brain.quant_metrics(d)
+    assert latest["atr_ratio"]==pytest.approx(series.atr_ratio)
+    assert latest["zscore"]==pytest.approx(series.zscore)
+    assert brain.market_bias_series(d).iloc[-1]==brain.market_bias(d)
 
 
 def test_backtest_reports_empty_window_without_fake_trades():
@@ -83,3 +106,11 @@ def test_backtest_reports_empty_window_without_fake_trades():
     assert out["trade_count"]>=0
     assert out["total_return_pct"]==pytest.approx((out["ending_balance"]/10000-1)*100)
     assert isinstance(out["monthly_trade_frequency"],dict)
+
+
+def test_backtest_exit_prices_include_adverse_slippage_and_spread():
+    future=pd.DataFrame({"low":[99.5],"high":[100.5],"close":[100.],"spread_price":[.0002]})
+    buy,_,_=_walk_exit(future,"BUY",100,99,102,None,.0001)
+    sell,_,_=_walk_exit(future,"SELL",100,101,98,None,.0001)
+    assert buy==pytest.approx(99.9999)
+    assert sell==pytest.approx(100.0003)

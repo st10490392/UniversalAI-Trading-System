@@ -6,6 +6,7 @@
 CTrade trade;
 
 input string ServerURL="http://127.0.0.1:8000";
+input string LicenseKey="";
 input int PollSeconds=2;
 input long MagicNumber=20261125;
 input int SlippagePoints=20;
@@ -14,6 +15,9 @@ double max_daily_dd_pct=5.0,max_total_dd_pct=10.0,risk_pct=0.5;
 double daily_start_equity=0.0,high_water_equity=0.0;
 datetime current_server_day=0;
 bool circuit_open=false;
+bool authorization_failed=false;
+bool authorization_alerted=false;
+bool poll_authorized=false;
 string last_signal_id="";
 string pending_signal="";
 string pending_signal_id="";
@@ -99,14 +103,15 @@ bool SendPoll(string &response)
    string url=ServerURL+"/api/ea/poll/"+(string)login+"/"+safe_symbol+
       "?balance="+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+
       "&equity="+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2);
-   char data[],result[];string headers="";
-   ResetLastError();int code=WebRequest("GET",url,"",5000,data,result,headers);
+   char data[],result[];string request_headers="X-License-Key: "+LicenseKey+"\r\n",response_headers="";
+   ResetLastError();int code=WebRequest("GET",url,request_headers,5000,data,result,response_headers);
    if(code<200 || code>=300){Print("UniversalAI poll failed HTTP=",code," err=",GetLastError());return false;}
    response=CharArrayToString(result,0,-1,CP_UTF8);return true;
 }
 
 void HandleSignal(const string json)
 {
+   if(authorization_failed)return;
    string decision=JsonString(json,"decision");if(decision!="BUY" && decision!="SELL"){pending_signal="";pending_signal_id="";return;}
    string sid=JsonString(json,"signal_id");if(sid=="" || AlreadyHandled(sid) || sid==pending_signal_id)return;
    double confidence=JsonNumber(json,"confidence",0.0);if(confidence<0.75)return;
@@ -123,7 +128,7 @@ void HandleSignal(const string json)
 
 void ExecuteSignal(const string json)
 {
-   if(circuit_open)return;
+   if(circuit_open || authorization_failed)return;
    string decision=JsonString(json,"decision"),sid=JsonString(json,"signal_id");
    if(sid=="" || AlreadyHandled(sid))return;
    double sl=JsonNumber(json,"sl",0),tp=JsonNumber(json,"tp",0);
@@ -147,7 +152,12 @@ void ExecuteSignal(const string json)
 
 void Poll()
 {
+   poll_authorized=false;
    string json;if(!SendPoll(json))return;
+   if(StringFind(json,"\"command\":\"UNAUTHORIZED\"")>=0 || StringFind(json,"\"command\": \"UNAUTHORIZED\"")>=0)
+   { authorization_failed=true;pending_signal="";pending_signal_id="";if(!authorization_alerted){Alert("UniversalAI: LICENSE UNAUTHORIZED for this MT5 account. Trading halted.");Print("UniversalAI: server rejected license/account binding; execution is disabled until authorization returns.");authorization_alerted=true;}return; }
+   if(authorization_failed){authorization_failed=false;authorization_alerted=false;Print("UniversalAI: license authorization restored.");}
+   poll_authorized=true;
    max_daily_dd_pct=JsonNumber(json,"max_daily_dd_pct",max_daily_dd_pct);
    max_total_dd_pct=JsonNumber(json,"max_total_dd_pct",max_total_dd_pct);
    risk_pct=JsonNumber(json,"risk_pct",risk_pct);
@@ -171,6 +181,6 @@ void OnTick(){CheckCircuit();}
 void OnTimer()
 {
    CheckCircuit();
-   if(pending_signal!="" && TimeCurrent()>=pending_after){string p=pending_signal;pending_signal="";ExecuteSignal(p);}
    Poll();
+   if(poll_authorized && pending_signal!="" && TimeCurrent()>=pending_after){string p=pending_signal;pending_signal="";ExecuteSignal(p);}
 }

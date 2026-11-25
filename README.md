@@ -1,74 +1,91 @@
 # UniversalAI Trading System
 
-An independently installable MT5 signal service and chart EA. The system is divided into a small set of documented Python, HTTP, storage, and MQL5 interfaces. It has no dependency on PHANTOM-TRADERS or any other trading repository.
+Independent MT5 signal service, account controls, historical research tools, mobile dashboard, and MQL5 execution adapter. This repository has no dependency on PHANTOM-TRADERS or any other trading project.
 
-## Components and boundaries
+## Components
 
-| Component | Responsibility | Interface |
+| File | Responsibility | Interface |
 | --- | --- | --- |
-| `brain.py` | MT5 M15/H1 data adapter, indicators, H1 bias, M15 sweep/FVG, Groq Qwen decision gate, account API | Pure functions `quant_metrics`, `market_bias`, `detect_smc`, `validate_decision`; JSON HTTP API |
-| `backtest.py` | Historical M15 CSV simulation with the same quant/SMC functions | `run_backtest(DataFrame, ...)` and command line |
-| `UniversalAI_EA.mq5` | MT5 polling, account-local drawdown circuit breaker, risk sizing, order execution | GET `/api/ea/poll/{account_id}/{symbol}` |
-| `index.html` | Mobile-friendly account configuration and monitoring UI | Dashboard REST endpoints with `X-Dashboard-PIN` |
+| `brain.py` | MT5 M15/H1 data, quantitative/SMC gates, Groq Qwen decisions, accounts and license API | Pure engine functions and FastAPI JSON routes |
+| `backtest.py` | Historical M15 simulation with rolling indicators, structure, costs, and drawdown | `run_backtest(DataFrame, ...)` or CLI |
+| `UniversalAI_EA.mq5` | License-bearing polling, local drawdown breaker, sizing, deduplication, execution | GET `/api/ea/poll/{account_id}/{symbol}` plus `X-License-Key` |
+| `index.html` | Mobile PWA activation, account view/settings, license admin panel | License/device headers and admin PIN routes |
 
-`brain.py` only publishes signals; it never sends an order. The EA requires a saved and active account, validates the signal and confidence, sizes from account risk and the broker's `OrderCalcProfit`, checks drawdown on every tick, and executes at market. A prop account receives a random 3–15 second delay and a random 1–3 point TP offset. The signal cache keeps a decision stable for the life of one M15 candle and avoids repeatedly asking the model on the EA's 2-second poll.
+The API never submits orders. The EA executes signals and checks its circuit breaker locally. Accounts start stopped unless the owner enables them. `accounts.db`, `.env`, historical CSVs, logs, and compiled `.ex5` files are local runtime artifacts and excluded from Git.
 
-The API creates `accounts.db` in the project directory by default. Set `UNIVERSALAI_DB` to move it outside the checkout. The database is runtime state and must not be committed.
+## License and device binding
 
-## Install on Windows
+- Dashboard activation submits a license key, MT5 account login, and browser-generated UUID. First activation atomically binds the account and device. Another account or device receives HTTP 403.
+- Dashboard APIs send `X-License-Key`, `X-License-Account-ID`, and `X-Device-ID`. EA polls send `X-License-Key`; the server requires an active, unexpired key bound to that account and previously claimed by a dashboard device. Invalid EA polls return `{"command":"UNAUTHORIZED"}`. Revocation takes effect on the next poll.
+- Set a private `ADMIN_PIN` in `.env`. The Admin panel issues keys formatted `UAI-XXXX-XXXX-XXXX`, lists bindings, toggles access, and clears a device binding. The account binding remains when a device is reset.
+- Device ID is a persistent browser-generated identifier, not hardware attestation. Protect the app with TLS and network access controls.
 
-1. Install 64-bit Python 3.11 or 3.12 and MetaTrader 5. Sign in to the intended terminal manually and keep it running. Install MetaEditor with MT5.
-2. In PowerShell, from this project directory:
+## Windows installation
 
-   ```powershell
-   py -3.12 -m venv .venv
-   .\.venv\Scripts\Activate.ps1
-   python -m pip install --upgrade pip
-   pip install -r requirements.txt
-   Copy-Item .env.example .env
-   ```
-
-3. Edit `.env` locally. Set a private dashboard PIN and `GROQ_API_KEY`. Do not commit `.env`. `GROQ_MODEL` defaults to `qwen/qwen3-32b`; use a model available to your Groq account. Configure `MT5_SYMBOLS` using the exact names shown in Market Watch. MT5 package calls use the currently signed-in terminal; the Python account's login must match the account configured in the dashboard.
-4. Start the API:
-
-   ```powershell
-   .\.venv\Scripts\Activate.ps1
-   python brain.py
-   ```
-
-   The default bind is `127.0.0.1:8000`, suitable for an EA on the same VM. Open `http://127.0.0.1:8000/`, enter the dashboard PIN, add the MT5 login and exact broker server name, then start the account. For remote phone access, put the app behind a TLS reverse proxy and a network firewall; do not expose the unauthenticated EA poll route directly to the internet.
-
-5. In MT5, open **Tools → Options → Expert Advisors**, enable **Allow WebRequest for listed URL**, and add `http://127.0.0.1:8000`. Open `UniversalAI_EA.mq5` in MetaEditor and compile it, copy the generated `.ex5` into the terminal's `MQL5\Experts` directory if needed, refresh Navigator, and attach it to each symbol/timeframe chart. Confirm the EA's account login/server match the dashboard entry and enable Algo Trading only after reviewing it on a demo account.
-
-`DASHBOARD_PIN` protects dashboard REST operations. The public health, dashboard shell and EA poll routes are intentionally excluded so MT5 does not need the PIN. Keep the server bound to localhost unless a trusted reverse proxy is configured. The page loads Tailwind from its CDN and therefore needs internet access for styling.
-
-## MT5 signal API
-
-`GET /api/ea/poll/{account_id}/{symbol}?balance={balance}&equity={equity}` returns `WAIT` while stopped, when there is no qualified setup, or when a decision fails validation. An accepted signal contains:
-
-```json
-{"decision":"BUY","entry":1.08,"sl":1.079,"tp":1.0825,"confidence":0.82,"reason":"...","signal_id":"EURUSD-...","risk_pct":0.5,"execution_delay_seconds":0,"tp_offset_points":0,"max_daily_dd_pct":5,"max_total_dd_pct":10}
-```
-
-All account-management routes (`/api/accounts`, `/api/accounts/{id}/status`, `/api/accounts/{id}/toggle`, `/api/logs/{id}`) require the `X-Dashboard-PIN` header. OpenAPI docs are at `/docs` on the local server.
-
-## Quant and signal rules
-
-- The gate requires ATR(14)/ATR(50) > 0.90 and Kaufman ER(20) > 0.25. A 50-close z-score blocks BUY above +2 and SELL below -2. At least 50 valid bars are required.
-- H1 bias requires EMA20/EMA50 agreement and two confirmed fractal higher highs/higher lows or lower highs/lower lows. The latest closed M15 setup combines a 20-bar liquidity sweep (close returns inside) with a three-candle FVG. The sweep can occur in the preceding four candles; requiring both on the same candle is incompatible with using that candle's first FVG bar in the 20-bar extreme.
-- Forex/Gold use UTC 07:00–10:00 and 12:00–16:00 windows. These fixed UTC approximations do not track London/New York daylight saving changes. Synthetic symbols identified by name skip the session check.
-- Groq is called only after both quantitative and SMC checks pass. Its response must match the setup side, have confidence >= 0.75, valid directional stop/target, and reward/risk >= 2.5.
-
-## Backtest
-
-Export an M15 chart from MT5 to CSV with headers `time,open,high,low,close` (volume is optional), convert `time` from broker server time to UTC, then run:
+Install 64-bit Python 3.11/3.12, MetaTrader 5, and MetaEditor. Sign in to the intended MT5 terminal manually. In PowerShell from this directory:
 
 ```powershell
-python backtest.py .\EURUSD_M15.csv --symbol EURUSD --risk-pct 0.5 --daily-dd 5 --total-dd 10 --output trades.csv
+py -3.12 -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+pip install -r requirements.txt
+Copy-Item .env.example .env
+notepad .env
 ```
 
-The report includes win rate, profit factor, max closed-trade drawdown, total return and monthly trade counts. Optional `--trailing-atr 1.0` enables an ATR trailing stop; default is fixed 1:2.5 reward/risk. For an OHLC candle that touches both stop and target, the simulator assumes the stop fills first. It models one open trade at a time and uses signal-candle wick stop distance; costs, spread, swaps, latency, partial fills, and broker-specific contract values are not modeled. Results are research estimates, not a prediction of live performance.
+Set `ADMIN_PIN`, optionally `GROQ_API_KEY`, and select a Groq-supported `GROQ_MODEL` (default `qwen/qwen3-32b`). Set `MT5_SYMBOLS` to exact Market Watch names. Do not commit `.env`.
 
-## Verification and current operational limits
+Start the server with `python brain.py`; it binds `127.0.0.1:8000` by default. Open `http://127.0.0.1:8000/`, activate a license with the MT5 login, save account risk settings, then press START. Use the Admin button and `ADMIN_PIN` to issue keys. Without `GROQ_API_KEY`, qualified setups fail closed as WAIT.
 
-Run automated checks with `python -m pytest`. The test suite uses synthetic data and a temporary SQLite database; it does not claim profitable performance or real-market validation. MT5 connectivity requires a logged-in terminal, exact broker symbols, and a licensed Groq API key. Test on a demo account before considering any live account. The EA's daily equity start resets at broker-server midnight. Its total-drawdown high-water mark begins when the EA is attached; removing/restarting the EA resets that in-memory high-water mark. The server does not authenticate EA poll requests, so keep it on loopback or behind a trusted private network.
+In MT5, open **Tools → Options → Expert Advisors**, enable **Allow WebRequest for listed URL**, and add `http://127.0.0.1:8000`. Compile `UniversalAI_EA.mq5` in MetaEditor. Attach the EA to charts, set the license key input, check the account login, and enable Algo Trading only on an account you intend to use. For remote mobile access, keep the service behind TLS and a private firewall/reverse proxy; the default server bind is loopback.
+
+## Azure setup
+
+Run `.\deploy_azure.ps1` from PowerShell in the repository. It creates a virtual environment, installs dependencies, prompts securely for `ADMIN_PIN` and an optional Groq key, writes `.env`, and launches FastAPI hidden with logs under `logs/`. It leaves the host bound to loopback. MT5 terminal installation/sign-in, TLS, firewall, and EA attachment remain explicit deployment steps.
+
+If `.env` does not exist and you need to add a Groq key later:
+
+```powershell
+if (-not (Test-Path .env)) { Copy-Item .env.example .env }; notepad .env
+```
+
+Set `GROQ_API_KEY=...` and restart the server. The repository includes `.env.example` with blank secret values.
+
+## API contracts
+
+- `POST /api/activate` body: `license_key`, `account_id`, `device_id`; binds the first account/device pair.
+- User account routes require `X-License-Key`, `X-License-Account-ID`, and `X-Device-ID`.
+- Admin routes `/api/admin/licenses/create`, `/api/admin/licenses`, `/api/admin/licenses/{key}/toggle`, and `/api/admin/licenses/{key}/reset-device` require `X-Admin-PIN`.
+- EA route `GET /api/ea/poll/{account_id}/{symbol}?balance=...&equity=...` requires `X-License-Key`; invalid license returns `command=UNAUTHORIZED`.
+- `/api/health`, dashboard shell, and activation are public. OpenAPI is at `/docs` on the local server.
+
+## Quant/SMC decisions
+
+- Quantitative gate: ATR14/ATR50 > 0.90, Kaufman ER20 > 0.25, with 50-close z-score blocks BUY above +2 and SELL below -2.
+- H1 bias: EMA20/EMA50 aligned with two confirmed fractal HH/HL or LH/LL pivots.
+- M15 structure: prior 20-bar liquidity sweep with close back inside, combined with a three-candle FVG. The sweep may occur in the four bars before the completed FVG.
+- Forex/Gold use approximate UTC windows 07:00–10:00 and 12:00–16:00; fixed UTC windows do not track London/New York DST. Synthetic symbol names bypass session filters.
+- Groq is called only after both gates pass. Output must match the setup side, confidence ≥0.75, directional stop/target, and minimum 2.5 reward/risk.
+
+## 12-month MT5 history and backtests
+
+The exporter requires the connected MT5 session to be a demo account. It skips symbols not visible in Market Watch and writes up to the previous 365 days of completed M15 data, including historical spread points and symbol point size:
+
+```powershell
+python tools/export_mt5_history.py
+python tools/run_backtests.py
+```
+
+The batch summary reports win rate, profit factor, max drawdown, return, and trade count. It uses each CSV's spread/point values, 2 points of adverse slippage, and a 20-point fallback spread when historical spread is zero/missing. Signals are evaluated after the M15 candle closes; OHLC bars touching stop and target together assume stop first. The model uses one trade at a time and does not include swaps, latency, partial fills, or broker contract-value differences. Backtest metrics are historical simulations, not expected or guaranteed results.
+
+Standalone CSV command:
+
+```powershell
+python backtest.py .\EURUSD_M15.csv --symbol EURUSD --risk-pct 1 --daily-dd 4 --total-dd 10 --spread-points 20 --slippage-points 2 --output trades.csv
+```
+
+CSV timestamps must be UTC. An `MT5` export from broker time must be converted before backtesting.
+
+## Verification
+
+Run `python -m pytest`. Tests use synthetic fixtures and temporary SQLite storage; they do not claim profitability, Groq connectivity, or live order placement. Test EA behavior on a demo terminal before considering any funded account. The server's EA poll route is not protected by an additional network token; license validation and loopback/private network deployment are required.

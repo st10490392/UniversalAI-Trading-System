@@ -4,7 +4,7 @@ MT5 and Groq are optional adapters. This service never places orders; execution
 and a second drawdown circuit breaker belong to the EA. See README.md for contracts.
 """
 from __future__ import annotations
-import json, logging, os, random, sqlite3, threading, time
+import json, logging, os, random, secrets, sqlite3, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -12,12 +12,14 @@ from typing import Any, Literal
 import numpy as np
 import pandas as pd
 import requests
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, HTTPException, Query, Header, Depends
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi import Request
 from pydantic import BaseModel, Field
+from dotenv import load_dotenv
 
 ROOT=Path(__file__).resolve().parent
+load_dotenv(ROOT/".env",override=False)
 DB_PATH=Path(os.getenv("UNIVERSALAI_DB",ROOT/"accounts.db"))
 SYMBOLS=[s.strip() for s in os.getenv("MT5_SYMBOLS","EURUSD,XAUUSD,Volatility 75 Index,Boom 1000 Index,Crash 1000 Index").split(",") if s.strip()]
 MODEL=os.getenv("GROQ_MODEL","qwen/qwen3-32b")
@@ -31,14 +33,6 @@ app=FastAPI(title="UniversalAI Trading API",version="1.0.0",lifespan=lifespan)
 _scanner_lock=threading.Lock()
 _analysis_cache:dict[str,tuple[int,dict[str,Any]|None]]={}
 
-@app.middleware("http")
-async def dashboard_pin(request:Request,call_next):
-    if request.url.path.startswith("/api/") and not request.url.path.startswith("/api/ea/poll/") and request.url.path!="/api/health":
-        pin=os.getenv("DASHBOARD_PIN","")
-        if not pin:return JSONResponse({"detail":"DASHBOARD_PIN is not configured"},status_code=503)
-        if request.headers.get("x-dashboard-pin","")!=pin:return JSONResponse({"detail":"Invalid dashboard PIN"},status_code=401)
-    return await call_next(request)
-
 def _connect():
     c=sqlite3.connect(DB_PATH,timeout=10); c.row_factory=sqlite3.Row; c.execute("PRAGMA journal_mode=WAL"); return c
 
@@ -49,6 +43,7 @@ def init_db():
         CREATE TABLE IF NOT EXISTS accounts(account_id TEXT PRIMARY KEY,broker_server TEXT NOT NULL,account_type TEXT NOT NULL CHECK(account_type IN ('prop','broker')),risk_pct REAL NOT NULL CHECK(risk_pct>0 AND risk_pct<=5),max_daily_dd_pct REAL NOT NULL CHECK(max_daily_dd_pct>0 AND max_daily_dd_pct<=100),max_total_dd_pct REAL NOT NULL CHECK(max_total_dd_pct>0 AND max_total_dd_pct<=100),active INTEGER NOT NULL DEFAULT 0,daily_start_balance REAL NOT NULL DEFAULT 0,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         CREATE TABLE IF NOT EXISTS trade_logs(id INTEGER PRIMARY KEY AUTOINCREMENT,account_id TEXT NOT NULL,symbol TEXT NOT NULL,signal_id TEXT NOT NULL,decision TEXT NOT NULL,confidence REAL NOT NULL DEFAULT 0,reason TEXT NOT NULL DEFAULT '',signal_json TEXT NOT NULL DEFAULT '{}',created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,UNIQUE(account_id,signal_id),FOREIGN KEY(account_id) REFERENCES accounts(account_id));
         CREATE TABLE IF NOT EXISTS account_state(account_id TEXT PRIMARY KEY,balance REAL NOT NULL DEFAULT 0,equity REAL NOT NULL DEFAULT 0,updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
+        CREATE TABLE IF NOT EXISTS licenses(license_key TEXT PRIMARY KEY,owner_name TEXT NOT NULL,bound_account_id TEXT NULL,bound_device_id TEXT NULL,expires_at TEXT NULL,is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP);
         """)
 
 class AccountConfig(BaseModel):
@@ -61,6 +56,50 @@ class AccountConfig(BaseModel):
     active:bool=False
     daily_start_balance:float=Field(default=0,ge=0)
 
+class ActivationRequest(BaseModel):
+    license_key:str=Field(min_length=1,max_length=32)
+    account_id:str=Field(min_length=1,max_length=40)
+    device_id:str=Field(min_length=8,max_length=128)
+
+class LicenseCreate(BaseModel):
+    owner_name:str=Field(min_length=1,max_length=120)
+    bound_account_id:str|None=Field(default=None,max_length=40)
+    expiry_days:int|None=Field(default=None,ge=1,le=3650)
+
+class LicenseToggle(BaseModel):
+    is_active:bool
+
+class LicenseContext(BaseModel):
+    account_id:str
+    license_key:str
+    device_id:str
+
+def _valid_license(license_key:str,account_id:str,device_id:str|None=None,bind:bool=False)->bool:
+    key=license_key.strip().upper()
+    if not key or not account_id:return False
+    with _connect() as c:
+        if bind:c.execute("BEGIN IMMEDIATE")
+        row=c.execute("SELECT * FROM licenses WHERE license_key=?",(key,)).fetchone()
+        if not row or not row["is_active"]:return False
+        if row["expires_at"] and datetime.fromisoformat(row["expires_at"])<=datetime.now(timezone.utc):return False
+        if row["bound_account_id"] and row["bound_account_id"]!=account_id:return False
+        if device_id is not None:
+            if row["bound_device_id"] and row["bound_device_id"]!=device_id:return False
+            if bind:
+                c.execute("UPDATE licenses SET bound_account_id=COALESCE(bound_account_id,?),bound_device_id=COALESCE(bound_device_id,?) WHERE license_key=?",(account_id,device_id,key))
+        elif not row["bound_account_id"] or not row["bound_device_id"]:
+            return False
+        return True
+
+def require_dashboard_license(x_license_key:str=Header(default=""),x_license_account_id:str=Header(default=""),x_device_id:str=Header(default=""))->LicenseContext:
+    if not _valid_license(x_license_key,x_license_account_id,x_device_id,bind=True):raise HTTPException(403,"License activation is invalid or bound to another account/device")
+    return LicenseContext(account_id=x_license_account_id,license_key=x_license_key.upper(),device_id=x_device_id)
+
+def require_admin(x_admin_pin:str=Header(default="")):
+    pin=os.getenv("ADMIN_PIN","")
+    if not pin:raise HTTPException(503,"ADMIN_PIN is not configured")
+    if not secrets.compare_digest(x_admin_pin,pin):raise HTTPException(401,"Invalid admin PIN")
+
 def _frame(data:Any)->pd.DataFrame:
     d=data.copy() if isinstance(data,pd.DataFrame) else pd.DataFrame(data)
     aliases={"tick_volume":"volume","real_volume":"volume"}
@@ -68,17 +107,21 @@ def _frame(data:Any)->pd.DataFrame:
     if not {"open","high","low","close"}.issubset(d.columns): raise ValueError("OHLC columns required")
     return d.reset_index(drop=True)
 
-def quant_metrics(data:Any)->dict[str,Any]:
-    """ATR14/ATR50, 50-close z-score, and Kaufman ER20, all on completed bars."""
+def quant_metrics_series(data:Any)->pd.DataFrame:
+    """Vectorized gate metrics for every row, using only current and earlier bars."""
     d=_frame(data); h,l,c=d.high.astype(float),d.low.astype(float),d.close.astype(float); prev=c.shift(1)
     tr=pd.concat([h-l,(h-prev).abs(),(l-prev).abs()],axis=1).max(axis=1)
     a14=tr.rolling(14,min_periods=14).mean(); a50=tr.rolling(50,min_periods=50).mean()
     mean=c.rolling(50,min_periods=50).mean(); std=c.rolling(50,min_periods=50).std(ddof=0)
     er=c.diff(20).abs()/c.diff().abs().rolling(20,min_periods=20).sum().replace(0,np.nan)
-    vals=[a14.iloc[-1],a50.iloc[-1],mean.iloc[-1],std.iloc[-1],er.iloc[-1]]
-    if any(pd.isna(v) for v in vals) or a50.iloc[-1]<=0: return {"ready":False,"atr14":0.,"atr50":0.,"atr_ratio":0.,"zscore":0.,"efficiency_ratio":0.,"gate":False}
-    ratio=float(a14.iloc[-1]/a50.iloc[-1]); z=float((c.iloc[-1]-mean.iloc[-1])/std.iloc[-1]) if std.iloc[-1]>0 else 0.; efficiency=float(er.iloc[-1])
-    return {"ready":True,"atr14":float(a14.iloc[-1]),"atr50":float(a50.iloc[-1]),"atr_ratio":ratio,"zscore":z,"efficiency_ratio":efficiency,"gate":bool(ratio>.90 and efficiency>.25)}
+    ratio=a14/a50.replace(0,np.nan); z=(c-mean)/std.replace(0,np.nan); z=z.fillna(0.)
+    ready=a14.notna()&a50.notna()&mean.notna()&std.notna()&er.notna()&(a50>0)
+    return pd.DataFrame({"ready":ready,"atr14":a14,"atr50":a50,"atr_ratio":ratio.fillna(0.),"zscore":z,"efficiency_ratio":er.fillna(0.),"gate":ready&(ratio>.90)&(er>.25)},index=d.index)
+
+def quant_metrics(data:Any)->dict[str,Any]:
+    """ATR14/ATR50, 50-close z-score, and Kaufman ER20 for the latest row."""
+    m=quant_metrics_series(data).iloc[-1]
+    return {"ready":bool(m.ready),"atr14":float(m.atr14) if pd.notna(m.atr14) else 0.,"atr50":float(m.atr50) if pd.notna(m.atr50) else 0.,"atr_ratio":float(m.atr_ratio),"zscore":float(m.zscore),"efficiency_ratio":float(m.efficiency_ratio),"gate":bool(m.gate)}
 
 def quant_allows(metrics:dict[str,Any],side:str)->bool:
     if not metrics.get("ready") or not metrics.get("gate"): return False
@@ -96,6 +139,21 @@ def market_bias(data:Any)->str:
     if e20>e50 and ph.iloc[-1]>ph.iloc[-2] and pl.iloc[-1]>pl.iloc[-2]:return "BULLISH"
     if e20<e50 and ph.iloc[-1]<ph.iloc[-2] and pl.iloc[-1]<pl.iloc[-2]:return "BEARISH"
     return "NEUTRAL"
+
+def market_bias_series(data:Any)->pd.Series:
+    """Vectorized H1 EMA/swing bias at each bar; pivots become known after 2 bars."""
+    d=_frame(data); c=d.close.astype(float); h,l=d.high.astype(float),d.low.astype(float)
+    e20=c.ewm(span=20,adjust=False).mean();e50=c.ewm(span=50,adjust=False).mean()
+    ph=(h.shift(2)<h)&(h.shift(1)<h)&(h.shift(-1)<h)&(h.shift(-2)<h)
+    pl=(l.shift(2)>l)&(l.shift(1)>l)&(l.shift(-1)>l)&(l.shift(-2)>l)
+    ch=h.where(ph).shift(2);cl=l.where(pl).shift(2)
+    last_h=ch.ffill();last_l=cl.ffill()
+    higher=(ch>last_h.shift(1)).astype("boolean").where(ch.notna()).ffill().fillna(False).astype(bool)
+    lower=(ch<last_h.shift(1)).astype("boolean").where(ch.notna()).ffill().fillna(False).astype(bool)
+    higher_l=(cl>last_l.shift(1)).astype("boolean").where(cl.notna()).ffill().fillna(False).astype(bool)
+    lower_l=(cl<last_l.shift(1)).astype("boolean").where(cl.notna()).ffill().fillna(False).astype(bool)
+    bullish=(e20>e50)&higher&higher_l;bearish=(e20<e50)&lower&lower_l
+    return pd.Series(np.select([bullish,bearish],["BULLISH","BEARISH"],default="NEUTRAL"),index=d.index)
 
 def detect_smc(data_m15:Any,bias:str)->dict[str,Any]|None:
     """Recent 20-bar liquidity sweep plus a three-candle FVG in H1 bias.
@@ -190,18 +248,56 @@ def pwa_icon():return FileResponse(ROOT/"icon.svg",media_type="image/svg+xml")
 @app.get("/api/health")
 def health():return {"status":"ok","groq_configured":bool(os.getenv("GROQ_API_KEY"))}
 
+@app.post("/api/activate")
+def activate(request:ActivationRequest):
+    if not _valid_license(request.license_key,request.account_id,request.device_id,bind=True):raise HTTPException(403,"License activation rejected")
+    return {"activated":True,"account_id":request.account_id}
+
+@app.post("/api/admin/licenses/create")
+def create_license(request:LicenseCreate,_admin:None=Depends(require_admin)):
+    alphabet="ABCDEFGHJKLMNPQRSTUVWXYZ23456789"
+    while True:
+        raw="".join(secrets.choice(alphabet) for _ in range(12));key="UAI-"+raw[:4]+"-"+raw[4:8]+"-"+raw[8:]
+        expires=(datetime.now(timezone.utc)+pd.Timedelta(days=request.expiry_days)).isoformat() if request.expiry_days else None
+        try:
+            with _connect() as c:c.execute("INSERT INTO licenses(license_key,owner_name,bound_account_id,expires_at) VALUES(?,?,?,?)",(key,request.owner_name.strip(),request.bound_account_id,expires))
+            return {"license_key":key,"owner_name":request.owner_name.strip(),"bound_account_id":request.bound_account_id,"expires_at":expires,"is_active":True}
+        except sqlite3.IntegrityError:continue
+
+@app.get("/api/admin/licenses")
+def list_licenses(_admin:None=Depends(require_admin)):
+    with _connect() as c:rows=c.execute("SELECT * FROM licenses ORDER BY created_at DESC").fetchall()
+    now=datetime.now(timezone.utc)
+    return [{**dict(r),"expired":bool(r["expires_at"] and datetime.fromisoformat(r["expires_at"])<=now)} for r in rows]
+
+@app.post("/api/admin/licenses/{key}/toggle")
+def toggle_license(key:str,request:LicenseToggle,_admin:None=Depends(require_admin)):
+    with _connect() as c:cur=c.execute("UPDATE licenses SET is_active=? WHERE license_key=?",(int(request.is_active),key.upper()))
+    if not cur.rowcount:raise HTTPException(404,"License not found")
+    return {"license_key":key.upper(),"is_active":request.is_active}
+
+@app.post("/api/admin/licenses/{key}/reset-device")
+def reset_license_device(key:str,_admin:None=Depends(require_admin)):
+    with _connect() as c:cur=c.execute("UPDATE licenses SET bound_device_id=NULL WHERE license_key=?",(key.upper(),))
+    if not cur.rowcount:raise HTTPException(404,"License not found")
+    return {"license_key":key.upper(),"device_reset":True}
+
 @app.get("/api/accounts")
-def accounts():
-    with _connect() as c:return [dict(r) for r in c.execute("SELECT * FROM accounts ORDER BY account_id")]
+def accounts(auth:LicenseContext=Depends(require_dashboard_license)):
+    with _connect() as c:
+        r=c.execute("SELECT * FROM accounts WHERE account_id=?",(auth.account_id,)).fetchone()
+        return [dict(r)] if r else []
 
 @app.post("/api/accounts")
-def save_account(config:AccountConfig):
+def save_account(config:AccountConfig,auth:LicenseContext=Depends(require_dashboard_license)):
+    if config.account_id!=auth.account_id:raise HTTPException(403,"Account does not match the activated license")
     init_db(); values=config.model_dump()
     with _connect() as c:c.execute("""INSERT INTO accounts(account_id,broker_server,account_type,risk_pct,max_daily_dd_pct,max_total_dd_pct,active,daily_start_balance) VALUES(:account_id,:broker_server,:account_type,:risk_pct,:max_daily_dd_pct,:max_total_dd_pct,:active,:daily_start_balance) ON CONFLICT(account_id) DO UPDATE SET broker_server=excluded.broker_server,account_type=excluded.account_type,risk_pct=excluded.risk_pct,max_daily_dd_pct=excluded.max_daily_dd_pct,max_total_dd_pct=excluded.max_total_dd_pct,active=excluded.active,daily_start_balance=excluded.daily_start_balance,updated_at=CURRENT_TIMESTAMP""",values)
     return {"saved":True,"account_id":config.account_id}
 
 @app.post("/api/accounts/{account_id}/toggle")
-def toggle(account_id:str,active:bool):
+def toggle(account_id:str,active:bool,auth:LicenseContext=Depends(require_dashboard_license)):
+    if account_id!=auth.account_id:raise HTTPException(403,"Account does not match the activated license")
     init_db()
     with _connect() as c:
         cur=c.execute("UPDATE accounts SET active=?,daily_start_balance=CASE WHEN ?=1 THEN COALESCE((SELECT balance FROM account_state WHERE account_id=?),daily_start_balance) ELSE daily_start_balance END,updated_at=CURRENT_TIMESTAMP WHERE account_id=?",(int(active),int(active),account_id,account_id))
@@ -209,19 +305,22 @@ def toggle(account_id:str,active:bool):
     return {"account_id":account_id,"active":active}
 
 @app.get("/api/accounts/{account_id}/status")
-def account_status(account_id:str):
+def account_status(account_id:str,auth:LicenseContext=Depends(require_dashboard_license)):
+    if account_id!=auth.account_id:raise HTTPException(403,"Account does not match the activated license")
     with _connect() as c:
         a=c.execute("SELECT * FROM accounts WHERE account_id=?",(account_id,)).fetchone();s=c.execute("SELECT * FROM account_state WHERE account_id=?",(account_id,)).fetchone()
     if not a:raise HTTPException(404,"Account not found")
     return {"account":dict(a),"state":dict(s) if s else {"balance":0,"equity":0}}
 
 @app.get("/api/logs/{account_id}")
-def logs(account_id:str,limit:int=Query(50,ge=1,le=200)):
+def logs(account_id:str,limit:int=Query(50,ge=1,le=200),auth:LicenseContext=Depends(require_dashboard_license)):
+    if account_id!=auth.account_id:raise HTTPException(403,"Account does not match the activated license")
     with _connect() as c:return [dict(r) for r in c.execute("SELECT * FROM trade_logs WHERE account_id=? ORDER BY id DESC LIMIT ?",(account_id,limit))]
 
 @app.get("/api/ea/poll/{account_id}/{symbol}")
-def ea_poll(account_id:str,symbol:str,balance:float=0,equity:float=0):
+def ea_poll(account_id:str,symbol:str,balance:float=0,equity:float=0,x_license_key:str=Header(default="")):
     init_db()
+    if not _valid_license(x_license_key,account_id):return {"command":"UNAUTHORIZED"}
     with _connect() as c:
         a=c.execute("SELECT * FROM accounts WHERE account_id=?",(account_id,)).fetchone()
         if not a:raise HTTPException(404,"Account not configured")
