@@ -199,7 +199,7 @@ def test_unapproved_symbol_is_never_sent_to_mt5_or_groq(monkeypatch,tmp_path):
     monkeypatch.setattr(brain,"APPROVED_PATH",tmp_path/"approved_strategies.json")
     def forbidden(*args,**kwargs):raise AssertionError("unapproved symbol must fail closed before live scan")
     monkeypatch.setattr(brain,"_mt5_rates",forbidden)
-    monkeypatch.setattr(brain,"groq_decision",forbidden)
+    monkeypatch.setattr(brain,"evaluate_llm_signal",forbidden)
     assert brain.analyze_symbol("EURUSD") is None
 
 
@@ -214,12 +214,27 @@ def test_approved_live_candidate_passes_exact_setup_and_quant_to_qwen(monkeypatc
     setup={"rule":"ema_cross_rsi_atr_expansion","entry_reference":1.2,"stop":1.19,"target":1.225,"risk_reward":2.5}
     quant={"atr14":.01,"atr_ratio":1.2,"zscore":.4,"er20":.4,"rsi":60}
     monkeypatch.setattr(brain,"live_candidates",lambda symbol,data,names,model_dir:[{"strategy":"Trend Momentum","side":"BUY","setup":setup,"quant":quant}])
-    seen={}
-    def qwen(context):seen.update(context);return {"decision":"BUY","entry":1.2,"sl":1.19,"tp":1.225,"confidence":.9,"reason":"sanity check passed"}
-    monkeypatch.setattr(brain,"groq_decision",qwen)
+    import json
+    from unittest.mock import Mock
+
+    monkeypatch.setattr(brain,"_analysis_cache",{})
+    monkeypatch.setenv("GROQ_API_KEY","test-key")
+    result={"decision":"BUY","entry":1.2,"sl":1.19,"tp":1.225,"confidence":.9,"reason":"sanity check passed"}
+    reply=Mock()
+    reply.json.side_effect=lambda: {"choices":[{"finish_reason":"stop","message":{"content":json.dumps(result)}}]}
+    post=Mock(return_value=reply)
+    monkeypatch.setattr(brain.requests,"post",post)
     out=brain.analyze_symbol("EURUSD")
     assert out["decision"]=="BUY" and out["strategy"]=="Trend Momentum" and out["breakeven_at_r"]==1.2
-    assert seen["setup"]==setup and seen["quant_metrics"]==quant
+    prompt=post.call_args.kwargs["json"]["messages"][0]["content"]
+    context=json.loads(prompt.split("Context: ",1)[1])
+    assert context["setup"]==setup and context["quant_metrics"]==quant
+
+    brain._analysis_cache.clear()
+    result["sl"]=1.21
+    out=brain.analyze_symbol("EURUSD")
+    assert out["command"]==out["decision"]=="WAIT"
+    assert out["sl"]==out["tp"]==out["confidence"]==0.0
 
 
 def test_approved_strategies_api_requires_license_and_returns_pairs(monkeypatch,tmp_path):
@@ -293,3 +308,60 @@ def test_research_point_commission_fallback_is_round_turn_once():
     d=pd.DataFrame({"time":pd.date_range("2025-01-01",periods=3,freq="15min",tz="UTC"),"open":[100.,100.,100.],"high":[100.5,100.5,100.5],"low":[99.5,99.5,99.5],"close":[100.,100.,100.],"point_size":[1.,1.,1.],"spread_points":[0.,0.,0.],"tick_size":[0.,0.,0.],"tick_value":[0.,0.,0.]})
     trade=research_lab._trade_one(d,0,1,10.,np.nan,breakeven=False,commission_per_lot=0.,slippage_points=0.,commission_points=2.,end_idx=3,horizon=1)
     assert trade["r"]==pytest.approx(-.2)
+
+def test_llm_signal_provider_chain(monkeypatch):
+    import json
+    from unittest.mock import Mock
+    import requests
+
+    for provider in ("GROQ", "GEMINI"):
+        monkeypatch.setenv(f"{provider}_API_KEY", f"test-{provider}")
+        monkeypatch.setenv(f"{provider}_MODEL", f"test-model-{provider}")
+        monkeypatch.setenv(f"{provider}_BASE_URL", f"https://{provider.lower()}.example/v1/")
+
+    def response(content):
+        reply = Mock()
+        reply.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
+        return reply
+
+    buy = {"decision": "BUY", "entry": 100, "sl": 96, "tp": 110, "confidence": .9, "reason": "Approved"}
+    sell = dict(buy, decision="SELL", sl=104, tp=90)
+    for valid in (buy, sell):
+        post = Mock(return_value=response("<think>analysis</think>\n```json\n" + json.dumps(valid) + "\n```"))
+        monkeypatch.setattr(brain.requests, "post", post)
+        assert brain.evaluate_llm_signal({"side": valid["decision"]}) == dict(valid, command=valid["decision"])
+        post.assert_called_once()
+
+    rate_limit = requests.Response()
+    rate_limit.status_code = 429
+    for error in (requests.ConnectionError(), requests.Timeout(), requests.HTTPError(response=rate_limit)):
+        post = Mock(side_effect=[error, response(json.dumps(buy))])
+        monkeypatch.setattr(brain.requests, "post", post)
+        assert brain.evaluate_llm_signal({"side": "BUY"}) == dict(buy, command="BUY")
+        assert [call.args[0] for call in post.call_args_list] == [
+            "https://groq.example/v1/chat/completions", "https://gemini.example/v1/chat/completions"
+        ]
+        assert post.call_args.kwargs["json"]["model"] == "test-model-GEMINI"
+
+    for replies, reason in (
+        ([requests.Timeout(), requests.HTTPError(response=rate_limit)], "GEMINI HTTP 429"),
+        ([requests.Timeout(), response("invalid JSON")], "GEMINI returned invalid"),
+        ([response(json.dumps(dict(buy, extra=True)))], "GROQ returned invalid"),
+        ([response(json.dumps(dict(buy, sl=101)))], "SL/TP risk"),
+        ([requests.Timeout(), response(json.dumps(dict(buy, tp=101)))], "SL/TP risk"),
+    ):
+        post = Mock(side_effect=replies)
+        monkeypatch.setattr(brain.requests, "post", post)
+        result = brain.evaluate_llm_signal({"side": "BUY"})
+        assert result["command"] == result["decision"] == "WAIT"
+        assert result["sl"] == result["tp"] == result["confidence"] == 0.0
+        assert reason in result["reason"]
+        assert post.call_count == len(replies)
+
+    monkeypatch.delenv("GROQ_API_KEY")
+    monkeypatch.delenv("GEMINI_API_KEY")
+    post.reset_mock()
+    result = brain.evaluate_llm_signal({"side": "BUY"})
+    assert result["command"] == "WAIT"
+    assert "GROQ_API_KEY" in result["reason"] and "GEMINI_API_KEY" in result["reason"]
+    post.assert_not_called()

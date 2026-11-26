@@ -1,6 +1,6 @@
 """UniversalAI: broker-independent quant/SMC engine and FastAPI service.
 
-MT5 and Groq are optional adapters. This service never places orders; execution
+MT5 and the LLM providers are optional adapters. This service never places orders; execution
 and a second drawdown circuit breaker belong to the EA. See README.md for contracts.
 """
 from __future__ import annotations
@@ -23,7 +23,11 @@ ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
 DB_PATH=Path(os.getenv("UNIVERSALAI_DB",ROOT/"accounts.db"))
 SYMBOLS=[s.strip() for s in os.getenv("MT5_SYMBOLS","EURUSD,XAUUSD,Volatility 75 Index,Boom 1000 Index,Crash 1000 Index").split(",") if s.strip()]
-MODEL=os.getenv("GROQ_MODEL","qwen/qwen3.8-27b")
+LLM_PROVIDERS=(
+    ("GROQ","https://api.groq.com/openai/v1","qwen/qwen3.8-27b"),
+    ("GEMINI","https://generativelanguage.googleapis.com/v1beta/openai/","gemini-3.1-flash-lite"),
+)
+SIGNAL_SCHEMA={"decision":"BUY|SELL|WAIT","entry":"number","sl":"number","tp":"number","confidence":"number","reason":"string"}
 LEVEL_TOLERANCE=float(os.getenv("UNIVERSALAI_LEVEL_TOLERANCE","0.10"))
 _THINK_RE=re.compile(r"<think>.*?</think>",re.S|re.I)
 LOG=logging.getLogger("universalai")
@@ -208,33 +212,69 @@ def _finite(v:Any)->float:
     if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(float(v)):raise ValueError("non-finite or non-numeric field")
     return float(v)
 
+def _unique_json_object(pairs:list[tuple[str,Any]])->dict[str,Any]:
+    result=dict(pairs)
+    if len(result)!=len(pairs):raise ValueError("duplicate JSON field")
+    return result
+
 def _parse_model_json(content:Any)->dict[str,Any]:
     """Strict parse: drop complete <think> blocks, reject unterminated ones, NaN/Infinity, trailing text and non-objects."""
     if not isinstance(content,str):raise ValueError("empty model content")
     text=_THINK_RE.sub("",content).strip()
     if re.search(r"</?think>",text,re.I):raise ValueError("unterminated think block")
-    text=re.sub(r"^```(?:json)?\s*|\s*```$","",text,flags=re.I).strip()
-    out=json.loads(text,parse_constant=_reject_constant)
+    fenced=re.fullmatch(r"```(?:json)?\s*(.*?)\s*```",text,re.I|re.S)
+    if fenced:text=fenced.group(1)
+    out=json.loads(text,parse_constant=_reject_constant,object_pairs_hook=_unique_json_object)
     if not isinstance(out,dict):raise ValueError("model JSON is not an object")
     return out
 
-def groq_decision(context:dict[str,Any])->dict[str,Any]:
-    key=os.getenv("GROQ_API_KEY","").strip()
-    if not key:raise RuntimeError("GROQ_API_KEY is not configured")
-    schema={"decision":"BUY|SELL|WAIT","entry":"number","sl":"number","tp":"number","confidence":"number","reason":"string"}
-    prompt="Return only a JSON object matching "+json.dumps(schema)+". Do not change setup side; uncertain means WAIT. Context: "+json.dumps(context)
-    body={"model":MODEL,"messages":[{"role":"user","content":prompt}],"temperature":.1,"max_completion_tokens":4096,"response_format":{"type":"json_object"}}
-    if "qwen" in MODEL.lower():body["reasoning_format"]="hidden"  # Groq: "raw" + JSON mode returns 400; hidden/parsed are valid
-    r=requests.post("https://api.groq.com/openai/v1/chat/completions",timeout=(3.05,20),headers={"Authorization":"Bearer "+key},json=body)
-    r.raise_for_status(); choice=r.json()["choices"][0]
-    if choice.get("finish_reason")!="stop":raise ValueError("incomplete model output: "+str(choice.get("finish_reason")))
-    out=_parse_model_json(choice["message"]["content"])
-    decision=out.get("decision")
-    if decision not in ("BUY","SELL","WAIT"):raise ValueError("Invalid model decision")
-    reason=str(out.get("reason",""))[:1000]
-    if decision=="WAIT":return {"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":reason}
-    # Whitelist: model-supplied extra keys must never reach the EA payload.
-    return {"decision":decision,"entry":_finite(out.get("entry")),"sl":_finite(out.get("sl")),"tp":_finite(out.get("tp")),"confidence":_finite(out.get("confidence")),"reason":reason}
+def _wait_signal(reason:str)->dict[str,Any]:
+    return {"command":"WAIT","decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":reason}
+
+def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
+    prompt="Return only a JSON object matching "+json.dumps(SIGNAL_SCHEMA)+". Do not change setup side; uncertain means WAIT. Context: "+json.dumps(context)
+    failures=[]
+    for provider,default_url,default_model in LLM_PROVIDERS:
+        key=os.getenv(provider+"_API_KEY","").strip()
+        if not key:
+            failures.append(provider+"_API_KEY is not configured")
+            continue
+        model=os.getenv(provider+"_MODEL",default_model)
+        base_url=os.getenv(provider+"_BASE_URL",default_url).rstrip("/")
+        body={"model":model,"messages":[{"role":"user","content":prompt}],"temperature":.1,"response_format":{"type":"json_object"}}
+        if provider=="GROQ":
+            body["max_completion_tokens"]=4096
+            if "qwen" in model.lower():body["reasoning_format"]="hidden"
+        else:
+            body["max_tokens"]=4096
+        try:
+            response=requests.post(base_url+"/chat/completions",timeout=(3.05,20),headers={"Authorization":"Bearer "+key},json=body)
+            response.raise_for_status()
+        except requests.RequestException as exc:
+            status=exc.response.status_code if exc.response is not None else None
+            failures.append(f"{provider} HTTP {status}" if status is not None else f"{provider} {type(exc).__name__}")
+            continue
+        try:
+            choice=response.json()["choices"][0]
+            if choice["finish_reason"]!="stop":return _wait_signal(f"{provider} returned incomplete output")
+            result=_parse_model_json(choice["message"]["content"])
+            if result.keys()!=SIGNAL_SCHEMA.keys() or result["decision"] not in ("BUY","SELL","WAIT"):
+                raise ValueError("invalid signal schema")
+            if not isinstance(result["reason"],str) or not result["reason"].strip():
+                raise ValueError("invalid reason")
+            for field in ("entry","sl","tp","confidence"):
+                result[field]=_finite(result[field])
+        except (ValueError,TypeError,IndexError,KeyError,OverflowError):
+            return _wait_signal(f"{provider} returned invalid signal JSON or schema")
+        decision=result["decision"]
+        result["reason"]=result["reason"][:1000]
+        if decision=="WAIT":return _wait_signal(result["reason"])
+        if not validate_decision(result,context.get("side",decision)):
+            return _wait_signal(f"{provider} signal failed side, confidence, or SL/TP risk validation")
+        if "setup" in context and not levels_match_setup(result,context["setup"]):
+            return _wait_signal(f"{provider} signal levels differ from the approved setup")
+        return {"command":decision,**result}
+    return _wait_signal("; ".join(failures))
 
 def validate_decision(result:dict[str,Any],side:str)->bool:
     try:c,e,sl,tp=(float(result[k]) for k in ("confidence","entry","sl","tp"))
@@ -293,13 +333,10 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
     decision=None
     for candidate in candidates:
         side=candidate["side"]
-        context={"symbol":symbol,"strategy":candidate["strategy"],"setup":candidate["setup"],"quant_metrics":candidate["quant"],"asset_class":m15["asset_class"].iloc[-1],"last_completed_bar_utc":str(m15.time.iloc[-1])}
-        try:
-            proposed=groq_decision(context)
-        except Exception as exc:
-            LOG.exception("Decision generation failed for %s / %s",symbol,candidate["strategy"])
-            proposed={"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":"Decision unavailable: "+type(exc).__name__}
-        if not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):proposed["decision"]="WAIT"
+        context={"symbol":symbol,"side":side,"strategy":candidate["strategy"],"setup":candidate["setup"],"quant_metrics":candidate["quant"],"asset_class":m15["asset_class"].iloc[-1],"last_completed_bar_utc":str(m15.time.iloc[-1])}
+        proposed=evaluate_llm_signal(context)
+        if proposed["decision"]!="WAIT" and not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):
+            proposed=_wait_signal("Signal failed approved setup validation")
         proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"bar_time":bar_time,"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
         decision=proposed
         if decision["decision"] in ("BUY","SELL"):break
@@ -414,11 +451,11 @@ def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Ac
         a=c.execute("SELECT * FROM accounts WHERE account_id=?",(account_id,)).fetchone()
         if not a:raise HTTPException(404,"Account not configured")
         c.execute("INSERT INTO account_state(account_id,balance,equity) VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET balance=excluded.balance,equity=excluded.equity,updated_at=CURRENT_TIMESTAMP",(account_id,balance,equity))
-    if not a["active"]:return {"decision":"WAIT","reason":"Account stopped","risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
+    if not a["active"]:return {**_wait_signal("Account stopped"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     with _scanner_lock:
         try:result=analyze_symbol(symbol,account_id)
         except Exception:LOG.exception("analyze_symbol failed for %s",symbol);result=None
-    if not result or result["decision"] not in ("BUY","SELL"):return {"decision":"WAIT","reason":"No qualified setup","risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
+    if not result or result["decision"] not in ("BUY","SELL"):return {**_wait_signal(result["reason"] if result else "No qualified setup"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     result=dict(result)  # never mutate the per-symbol cache shared across accounts/threads
     result.update({"execution_delay_seconds":random.randint(3,15) if a["account_type"]=="prop" else 0,"tp_offset_points":random.uniform(1,3) if a["account_type"]=="prop" else 0,"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]})
     return result
