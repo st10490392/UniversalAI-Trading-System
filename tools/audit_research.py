@@ -29,6 +29,50 @@ def _legacy_module() -> dict[str, Any]:
     return namespace
 
 
+def _legacy_event_breakdown(trades: list[dict[str, Any]], *, iterations: int, risk_pct: float, seed: int) -> dict[str, float]:
+    """Instrument the committed path logic without changing its event semantics."""
+    from collections import Counter
+
+    ordered = sorted(trades, key=lambda t: pd.Timestamp(t["time"]))
+    returns = np.asarray([float(t["r"]) for t in ordered], dtype=float)
+    dates = [pd.Timestamp(t["time"]) for t in ordered]
+    day_counts = list(Counter(d.date() for d in dates).values())
+    rng = np.random.default_rng(seed)
+    daily_hits = total_hits = both_hits = zero_hits = 0
+    for _ in range(iterations):
+        shuffled = rng.permutation(returns)
+        equity = peak = 1.0
+        cursor = 0
+        daily_hit = total_hit = equity_zero = False
+        for day_count in day_counts:
+            day_start = equity
+            day_breached = False
+            for outcome in shuffled[cursor:cursor + day_count]:
+                cursor += 1
+                if day_breached or total_hit or equity_zero:
+                    continue
+                equity *= max(0.0, 1.0 + outcome * risk_pct / 100.0)
+                equity_zero = equity <= 0.0
+                peak = max(peak, equity)
+                drawdown = (peak - equity) / peak * 100.0 if peak else 100.0
+                if (day_start - equity) / max(day_start, 1e-12) * 100.0 >= 5.0:
+                    day_breached = daily_hit = True
+                if drawdown >= 10.0:
+                    total_hit = True
+        daily_hits += int(daily_hit)
+        total_hits += int(total_hit)
+        both_hits += int(daily_hit and total_hit)
+        zero_hits += int(equity_zero)
+    either_hits = daily_hits + total_hits - both_hits
+    return {
+        "daily_only_pct": (daily_hits - both_hits) / iterations * 100,
+        "total_only_pct": (total_hits - both_hits) / iterations * 100,
+        "both_limits_pct": both_hits / iterations * 100,
+        "either_limit_pct": either_hits / iterations * 100,
+        "equity_zero_pct": zero_hits / iterations * 100,
+    }
+
+
 def reproduce_legacy_candidates() -> list[dict[str, Any]]:
     old = _legacy_module()
     files = sorted(DATA.glob("*_M15_2020_2025.csv"))
@@ -56,6 +100,7 @@ def reproduce_legacy_candidates() -> list[dict[str, Any]]:
         )
         seed = 42 + file_ix * 100 + ord(strategy_id)
         mc = old["_monte_carlo"](trades, iterations=1000, risk_pct=.75, seed=seed)
+        event_breakdown = _legacy_event_breakdown(trades, iterations=1000, risk_pct=.75, seed=seed)
         rvals = np.asarray([float(t["r"]) for t in trades])
         theoretical_zero_count = int(np.sum(1 + rvals * .0075 <= 0))
         snapshot = stored.get((symbol, strategy_id), {})
@@ -65,6 +110,7 @@ def reproduce_legacy_candidates() -> list[dict[str, Any]]:
             "reported_legacy_ruin_pct": snapshot.get("monte_carlo", {}).get("probability_of_ruin_pct"),
             "reproduced_legacy_ruin_pct": mc["probability_of_ruin_pct"],
             "legacy_p95_max_drawdown_pct": mc["p95_max_drawdown_pct"],
+            "legacy_event_breakdown": event_breakdown,
             "any_single_trade_nonpositive_equity_possible": bool(theoretical_zero_count),
             "legacy_definition": "a simulated path hit daily >=5% OR peak-to-trough total >=10%; not account equity zero",
         })

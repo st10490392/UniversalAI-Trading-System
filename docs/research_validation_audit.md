@@ -10,11 +10,11 @@ In `df59bb5`, each of 1,000 iterations permuted the candidate's net trade R outc
 
 The audit dynamically loaded the exact committed implementation, recreated the three signal streams, and reproduced the persisted results with the same seeds:
 
-| Pair | Seed | Raw sequence trades reshuffled | Reported OOS executed trades | Legacy either-limit paths | p95 max DD |
-|---|---:|---:|---:|---:|---:|
-| Range Break 200 / Trend Momentum | 2807 | 956 | 956 | 68.3% | 10.6758% |
-| Range Break 200 / ICT / SMC | 2808 | 1,078 | 279 | 99.5% | 10.6919% |
-| Volatility 250 (1s) / Trend Momentum | 4607 | 913 | 150 | 100.0% | 37.1213% |
+| Pair | Seed | Raw sequence trades reshuffled | Reported OOS executed trades | Daily only | Total only | Both | Either-limit (“ruin”) | Equity zero | p95 max DD |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Range Break 200 / Trend Momentum | 2807 | 956 | 956 | 0.1% | 68.2% | 0.0% | 68.3% | 0.0% | 10.6758% |
+| Range Break 200 / ICT / SMC | 2808 | 1,078 | 279 | 0.0% | 99.5% | 0.0% | 99.5% | 0.0% | 10.6919% |
+| Volatility 250 (1s) / Trend Momentum | 4607 | 913 | 150 | 0.0% | 0.2% | 99.8% | 100.0% | 0.0% | 37.1213% |
 
 The OOS trade count and PF are calculated from the original chronological run after risk stops; Monte Carlo reshuffles the unfiltered pre-stop outcomes and reapplies stops under each permutation. Thus the candidates' qualifying trade count/PF and Monte Carlo sample do not describe the same executed sequence. The 68.3%, 99.5%, and 100% values are path frequencies, rounded by increments of 0.1 percentage point, not account-zero probabilities.
 
