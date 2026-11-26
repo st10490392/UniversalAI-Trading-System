@@ -10,11 +10,18 @@ input string LicenseKey="";
 input int PollSeconds=2;
 input long MagicNumber=20261125;
 input int SlippagePoints=20;
+input int MaxSignalAgeSeconds=1800;   // reject signals whose M15 bar is older than this (server time)
 
-double max_daily_dd_pct=5.0,max_total_dd_pct=10.0,risk_pct=0.5;
+#define HARD_DAILY_DD_PCT 5.0
+#define HARD_TOTAL_DD_PCT 10.0
+#define HARD_RISK_PCT 5.0
+
+double max_daily_dd_pct=HARD_DAILY_DD_PCT,max_total_dd_pct=HARD_TOTAL_DD_PCT,risk_pct=0.5;
 double daily_start_equity=0.0,high_water_equity=0.0;
 datetime current_server_day=0;
 bool circuit_open=false;
+bool daily_lock=false,total_lock=false;   // total_lock never auto-clears: delete GV *_tlock to re-arm manually
+double p_high=-1.0,p_daily=-1.0;bool p_dl=false,p_tl=false;datetime last_state_save=0;
 bool authorization_failed=false;
 bool authorization_alerted=false;
 bool poll_authorized=false;
@@ -31,15 +38,21 @@ string AccountStateKey(const string suffix)
 { return "UAI_"+(string)AccountInfoInteger(ACCOUNT_LOGIN)+"_"+(string)MagicNumber+"_"+suffix; }
 double DayStamp()
 { MqlDateTime x;TimeToStruct(TimeCurrent(),x);return (double)(x.year*10000+x.mon*100+x.day); }
-double SignalEpoch(const string sid)
+// signal_id is "<symbol>-<bar_time>-<Strategy_Name>": the old "text after last dash" parse returned 0 for every
+// real id, so nothing was persisted and a restart re-fired the same bar. The server now sends numeric bar_time.
+bool AlreadyHandled(const string sid,const double bar)
+{ return sid==last_signal_id || (bar>0.0 && bar<=last_signal_epoch); }
+void RememberSignal(const string sid,const double bar)
+{ last_signal_id=sid;if(bar>last_signal_epoch)last_signal_epoch=bar;GlobalVariableSet(SignalStateKey(),last_signal_epoch); }
+bool HasOpenPosition()
 {
-   int dash=-1;for(int i=0;i<StringLen(sid);i++)if(StringGetCharacter(sid,i)=='-')dash=i;
-   if(dash<0)return 0.0;return (double)StringToInteger(StringSubstr(sid,dash+1));
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong t=PositionGetTicket(i);if(t==0)continue;
+      if(PositionGetInteger(POSITION_MAGIC)==MagicNumber && PositionGetString(POSITION_SYMBOL)==_Symbol)return true;
+   }
+   return false;
 }
-bool AlreadyHandled(const string sid)
-{ double epoch=SignalEpoch(sid);return sid==last_signal_id || (epoch>0.0 && epoch<=last_signal_epoch); }
-void RememberSignal(const string sid)
-{ last_signal_id=sid;last_signal_epoch=MathMax(last_signal_epoch,SignalEpoch(sid));GlobalVariableSet(SignalStateKey(),last_signal_epoch); }
 
 string JsonString(const string json,const string key)
 {
@@ -69,35 +82,117 @@ void CloseMagicPositions()
    }
 }
 
+// Persist to BOTH terminal globals and a COMMON-folder file: globals are only flushed on clean shutdown,
+// so a terminal crash/kill would otherwise lose peak equity and the lock flags.
+void PersistIfNeeded(const bool force)
+{
+   datetime now=TimeLocal();
+   if(!force && now-last_state_save<5)return;
+   if(!force && high_water_equity==p_high && daily_start_equity==p_daily && daily_lock==p_dl && total_lock==p_tl)return;
+   GlobalVariableSet(AccountStateKey("day"),DayStamp());
+   GlobalVariableSet(AccountStateKey("daily"),daily_start_equity);
+   GlobalVariableSet(AccountStateKey("high"),high_water_equity);
+   GlobalVariableSet(AccountStateKey("lock"),daily_lock?1.0:0.0);
+   GlobalVariableSet(AccountStateKey("tlock"),total_lock?1.0:0.0);
+   int h=FileOpen(AccountStateKey("state")+".txt",FILE_WRITE|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   if(h!=INVALID_HANDLE)
+   {
+      FileWriteString(h,StringFormat("%.0f|%.2f|%.2f|%d|%d",DayStamp(),daily_start_equity,high_water_equity,daily_lock?1:0,total_lock?1:0));
+      FileClose(h);
+   }
+   p_high=high_water_equity;p_daily=daily_start_equity;p_dl=daily_lock;p_tl=total_lock;last_state_save=now;
+}
+
+// Conservative merge of globals + file: highest peak, highest same-day start equity, any lock wins.
+void LoadState(const double equity)
+{
+   double stamp=DayStamp(),hw=0.0,daily=0.0;bool dl=false,tl=false;
+   if(GlobalVariableCheck(AccountStateKey("high")))hw=GlobalVariableGet(AccountStateKey("high"));
+   if(GlobalVariableCheck(AccountStateKey("tlock")) && GlobalVariableGet(AccountStateKey("tlock"))>0.5)tl=true;
+   if(GlobalVariableCheck(AccountStateKey("day")) && GlobalVariableGet(AccountStateKey("day"))==stamp && GlobalVariableCheck(AccountStateKey("daily")))
+   {
+      daily=GlobalVariableGet(AccountStateKey("daily"));
+      if(GlobalVariableCheck(AccountStateKey("lock")) && GlobalVariableGet(AccountStateKey("lock"))>0.5)dl=true;
+   }
+   int h=FileOpen(AccountStateKey("state")+".txt",FILE_READ|FILE_TXT|FILE_ANSI|FILE_COMMON);
+   if(h!=INVALID_HANDLE)
+   {
+      string line=FileReadString(h);FileClose(h);string p[];
+      if(StringSplit(line,'|',p)==5)
+      {
+         hw=MathMax(hw,StringToDouble(p[2]));
+         if(StringToDouble(p[4])>0.5)tl=true;
+         if(StringToDouble(p[0])==stamp){daily=MathMax(daily,StringToDouble(p[1]));if(StringToDouble(p[3])>0.5)dl=true;}
+      }
+   }
+   high_water_equity=MathMax(hw,equity);
+   daily_start_equity=daily>0.0?daily:equity;   // equity may be 0 before the first account update; CheckCircuit re-seeds
+   daily_lock=dl;total_lock=tl;
+}
+
 void CheckCircuit()
 {
-   datetime now=TimeCurrent(),day=DayStart(now);double equity=AccountInfoDouble(ACCOUNT_EQUITY);
-   if(day!=current_server_day){current_server_day=day;daily_start_equity=equity;circuit_open=false;GlobalVariableSet(AccountStateKey("day"),DayStamp());GlobalVariableSet(AccountStateKey("daily"),daily_start_equity);GlobalVariableSet(AccountStateKey("lock"),0.0);}
-   if(high_water_equity<=0)high_water_equity=equity;
-   high_water_equity=MathMax(high_water_equity,equity);GlobalVariableSet(AccountStateKey("high"),high_water_equity);
-   if(GlobalVariableCheck(AccountStateKey("lock")) && GlobalVariableGet(AccountStateKey("lock"))>0.5)circuit_open=true;
-   double daily_dd=daily_start_equity>0?(daily_start_equity-equity)/daily_start_equity*100.0:0.0;
-   double total_dd=high_water_equity>0?(high_water_equity-equity)/high_water_equity*100.0:0.0;
-   if(daily_dd>=max_daily_dd_pct || total_dd>=max_total_dd_pct){circuit_open=true;GlobalVariableSet(AccountStateKey("lock"),1.0);}
+   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
+   if(equity<=0.0 || !MathIsValidNumber(equity)){circuit_open=true;return;}   // unknown equity: block entries, never trade blind
+   datetime day=DayStart(TimeCurrent());
+   if(day!=current_server_day){current_server_day=day;daily_start_equity=equity;daily_lock=false;PersistIfNeeded(true);}
+   if(daily_start_equity<=0.0)daily_start_equity=equity;   // old code left 0 here => daily check silently disabled all day
+   if(high_water_equity<=0.0)high_water_equity=equity;
+   if(equity>high_water_equity)high_water_equity=equity;
+   // ACCOUNT_EQUITY already includes floating P/L, so intra-trade breaches trip here on every tick and timer.
+   double daily_dd=(daily_start_equity-equity)/daily_start_equity*100.0;
+   double total_dd=(high_water_equity-equity)/high_water_equity*100.0;
+   if(daily_dd>=max_daily_dd_pct)daily_lock=true;
+   if(total_dd>=max_total_dd_pct)total_lock=true;
+   circuit_open=daily_lock||total_lock;
+   PersistIfNeeded(daily_lock!=p_dl || total_lock!=p_tl);
    if(circuit_open)CloseMagicPositions();
 }
 
-double NormalizeLots(double lots)
+int StepDigits(const double v)
+{ int d=0;double s=v;while(d<8 && MathAbs(s-MathRound(s))>1e-9){s*=10.0;d++;}return d; }
+
+// Returns 0 (skip trade) instead of rounding UP to SYMBOL_VOLUME_MIN: the old MathMax(minv,..) silently
+// exceeded the risk budget whenever risk-sized lots < min lot (Vol 75, Range Break, small accounts).
+double NormalizeLots(const double raw)
 {
    double minv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MIN),maxv=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_MAX),step=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_STEP);
-   if(step<=0.0)return 0.0;
-   lots=MathMax(minv,MathMin(maxv,lots));
-   lots=MathFloor(lots/step+1e-9)*step;
-   int digits=2;if(step<0.01)digits=3;if(step<0.001)digits=4;
-   return NormalizeDouble(MathMax(minv,lots),digits);
+   if(step<=0.0 || minv<=0.0 || maxv<minv || !MathIsValidNumber(raw) || raw<minv)return 0.0;
+   double lots=MathMin(maxv,raw);
+   double limit=SymbolInfoDouble(_Symbol,SYMBOL_VOLUME_LIMIT);
+   if(limit>0.0)
+   {
+      double held=0.0;
+      for(int i=PositionsTotal()-1;i>=0;i--){ulong t=PositionGetTicket(i);if(t!=0 && PositionGetString(POSITION_SYMBOL)==_Symbol)held+=PositionGetDouble(POSITION_VOLUME);}
+      lots=MathMin(lots,limit-held);if(lots<minv)return 0.0;
+   }
+   lots=minv+MathFloor((lots-minv)/step+1e-9)*step;   // step grid is anchored at min volume
+   if(lots<minv || lots>maxv)return 0.0;
+   return NormalizeDouble(lots,MathMax(StepDigits(step),StepDigits(minv)));
 }
 
-double RiskLots(const ENUM_ORDER_TYPE type,const double entry,const double sl)
+// lots=0 => skip. risk_used_pct is the real post-rounding loss at SL as % of min(balance,equity).
+double RiskLots(const ENUM_ORDER_TYPE type,const double entry,const double sl,double &risk_used_pct)
 {
-   double risk_money=AccountInfoDouble(ACCOUNT_BALANCE)*risk_pct/100.0,profit=0.0;
-   if(!OrderCalcProfit(type,_Symbol,1.0,entry,sl,profit))return 0.0;
-   double loss=MathAbs(profit);if(loss<=0.0)return 0.0;
-   return NormalizeLots(risk_money/loss);
+   risk_used_pct=0.0;
+   double base=MathMin(AccountInfoDouble(ACCOUNT_BALANCE),AccountInfoDouble(ACCOUNT_EQUITY));
+   double rp=MathMin(risk_pct,HARD_RISK_PCT);
+   if(base<=0.0 || rp<=0.0 || !MathIsValidNumber(rp))return 0.0;
+   double risk_money=base*rp/100.0,profit=0.0,loss=0.0;
+   if(OrderCalcProfit(type,_Symbol,1.0,entry,sl,profit))loss=MathAbs(profit);
+   if(loss<=0.0)   // fallback: tick math (guard zero tick size/value on exotic symbols)
+   {
+      double tv=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE_LOSS),ts=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_SIZE);
+      if(tv<=0.0)tv=SymbolInfoDouble(_Symbol,SYMBOL_TRADE_TICK_VALUE);
+      if(tv<=0.0 || ts<=0.0)return 0.0;
+      loss=MathAbs(entry-sl)/ts*tv;
+   }
+   if(loss<=0.0 || !MathIsValidNumber(loss))return 0.0;
+   double lots=NormalizeLots(risk_money/loss);if(lots<=0.0)return 0.0;
+   double margin=0.0;
+   if(!OrderCalcMargin(type,_Symbol,lots,entry,margin) || margin<=0.0 || margin>AccountInfoDouble(ACCOUNT_MARGIN_FREE)*0.9)return 0.0;
+   risk_used_pct=loss*lots/base*100.0;
+   return lots;
 }
 
 void ManageBreakeven()
@@ -153,9 +248,10 @@ void HandleSignal(const string json)
 {
    if(authorization_failed)return;
    string decision=JsonString(json,"decision");if(decision!="BUY" && decision!="SELL"){pending_signal="";pending_signal_id="";return;}
-   string sid=JsonString(json,"signal_id");if(sid=="" || AlreadyHandled(sid) || sid==pending_signal_id)return;
+   string sid=JsonString(json,"signal_id");if(sid=="" || AlreadyHandled(sid,JsonNumber(json,"bar_time",0.0)) || sid==pending_signal_id)return;
    double confidence=JsonNumber(json,"confidence",0.0);if(confidence<0.75)return;
-   risk_pct=JsonNumber(json,"risk_pct",risk_pct);
+   double rp=JsonNumber(json,"risk_pct",0.0);if(rp<=0.0)return;   // unparsable risk must not fall through to min-lot sizing
+   risk_pct=MathMin(rp,HARD_RISK_PCT);
    double entry=JsonNumber(json,"entry",0.0),sl=JsonNumber(json,"sl",0.0),tp=JsonNumber(json,"tp",0.0);
    double offset=JsonNumber(json,"tp_offset_points",0.0);if(offset>0.0)tp+=(decision=="BUY"?1.0:-1.0)*offset*_Point;
    if(entry<=0 || sl<=0 || tp<=0)return;
@@ -168,11 +264,17 @@ void HandleSignal(const string json)
 
 void ExecuteSignal(const string json)
 {
+   CheckCircuit();   // re-check after the (up to 15 s) prop delay and the blocking WebRequest
    if(circuit_open || authorization_failed)return;
    string decision=JsonString(json,"decision"),sid=JsonString(json,"signal_id");
-   if(sid=="" || AlreadyHandled(sid))return;
+   if(decision!="BUY" && decision!="SELL")return;
+   double bar=JsonNumber(json,"bar_time",0.0);
+   if(sid=="" || AlreadyHandled(sid,bar))return;
+   if(bar>0.0 && (double)TimeCurrent()-bar>(double)MaxSignalAgeSeconds){Print("Stale signal skipped ",sid);RememberSignal(sid,bar);return;}
+   if(HasOpenPosition()){Print("Position already open on ",_Symbol,"; skipped ",sid);RememberSignal(sid,bar);return;}
+   if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) || SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE)!=SYMBOL_TRADE_MODE_FULL)return;
    double sl=JsonNumber(json,"sl",0),tp=JsonNumber(json,"tp",0);
-   risk_pct=JsonNumber(json,"risk_pct",risk_pct);
+   double rp=JsonNumber(json,"risk_pct",0.0);if(rp<=0.0)return;risk_pct=MathMin(rp,HARD_RISK_PCT);
    double offset=JsonNumber(json,"tp_offset_points",0);if(offset>0)tp+=(decision=="BUY"?1.0:-1.0)*offset*_Point;
    double entry=(decision=="BUY")?SymbolInfoDouble(_Symbol,SYMBOL_ASK):SymbolInfoDouble(_Symbol,SYMBOL_BID);
    if(entry<=0.0)return;
@@ -181,10 +283,16 @@ void ExecuteSignal(const string json)
    bool valid=(decision=="BUY")?(sl<entry && tp>entry):(tp<entry && sl>entry);
    double min_stop=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
    if(!valid || risk_distance<min_stop || reward_distance<min_stop || reward_distance/risk_distance<2.5)
-   { Print("Signal became invalid at market price; skipped ",sid);RememberSignal(sid);return; }
+   { Print("Signal became invalid at market price; skipped ",sid);RememberSignal(sid,bar);return; }
    ENUM_ORDER_TYPE type=(decision=="BUY"?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
-   double lots=RiskLots(type,entry,sl);if(lots<=0){Print("Risk lot calculation failed for ",sid);return;}
-   trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);
+   double used=0.0,lots=RiskLots(type,entry,sl,used);
+   if(lots<=0.0){Print("Risk lot calculation failed / below min lot / margin; skipped ",sid);RememberSignal(sid,bar);return;}
+   // Do not open a trade whose stop-out alone would breach a limit given current drawdown.
+   double eq=AccountInfoDouble(ACCOUNT_EQUITY);
+   double dnow=(daily_start_equity-eq)/daily_start_equity*100.0,tnow=(high_water_equity-eq)/high_water_equity*100.0;
+   if(dnow+used>=max_daily_dd_pct || tnow+used>=max_total_dd_pct){Print("DD headroom too small for risk ",DoubleToString(used,2),"%; skipped ",sid);RememberSignal(sid,bar);return;}
+   trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);trade.SetTypeFillingBySymbol(_Symbol);
+   RememberSignal(sid,bar);   // at-most-once: persist BEFORE sending so a timeout/crash cannot re-fire the same signal
    bool ok=(decision=="BUY")?trade.Buy(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid):trade.Sell(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid);
    if(ok)
    {
@@ -201,9 +309,9 @@ void ExecuteSignal(const string json)
             GlobalVariableSet(trigger_key,be);
          }
       }
-      RememberSignal(sid);pending_signal_id="";
+      pending_signal_id="";
    }
-   else Print("Order failed ",sid," retcode=",trade.ResultRetcode()," ",trade.ResultRetcodeDescription());
+   else Print("Order failed ",sid," retcode=",trade.ResultRetcode()," ",trade.ResultRetcodeDescription()," (not retried this bar)");
 }
 
 void Poll()
@@ -214,25 +322,25 @@ void Poll()
    { authorization_failed=true;pending_signal="";pending_signal_id="";if(!authorization_alerted){Alert("UniversalAI: LICENSE UNAUTHORIZED for this MT5 account. Trading halted.");Print("UniversalAI: server rejected license/account binding; execution is disabled until authorization returns.");authorization_alerted=true;}return; }
    if(authorization_failed){authorization_failed=false;authorization_alerted=false;Print("UniversalAI: license authorization restored.");}
    poll_authorized=true;
-   max_daily_dd_pct=JsonNumber(json,"max_daily_dd_pct",max_daily_dd_pct);
-   max_total_dd_pct=JsonNumber(json,"max_total_dd_pct",max_total_dd_pct);
-   risk_pct=JsonNumber(json,"risk_pct",risk_pct);
+   // Server may only TIGHTEN limits (server schema allows up to 100%); bad/zero values keep the previous limit.
+   double md=JsonNumber(json,"max_daily_dd_pct",0.0),mt=JsonNumber(json,"max_total_dd_pct",0.0);
+   if(md>0.0)max_daily_dd_pct=MathMin(md,HARD_DAILY_DD_PCT);
+   if(mt>0.0)max_total_dd_pct=MathMin(mt,HARD_TOTAL_DD_PCT);
    CheckCircuit();if(!circuit_open)HandleSignal(json);
 }
 
 int OnInit()
 {
    if(PollSeconds<1)return INIT_PARAMETERS_INCORRECT;
-   trade.SetExpertMagicNumber(MagicNumber);current_server_day=DayStart(TimeCurrent());
-   double equity=AccountInfoDouble(ACCOUNT_EQUITY);
-   high_water_equity=GlobalVariableCheck(AccountStateKey("high"))?GlobalVariableGet(AccountStateKey("high")):equity;
-   if(GlobalVariableCheck(AccountStateKey("day")) && GlobalVariableGet(AccountStateKey("day"))==DayStamp() && GlobalVariableCheck(AccountStateKey("daily")))daily_start_equity=GlobalVariableGet(AccountStateKey("daily"));
-   else{daily_start_equity=equity;GlobalVariableSet(AccountStateKey("day"),DayStamp());GlobalVariableSet(AccountStateKey("daily"),daily_start_equity);GlobalVariableSet(AccountStateKey("lock"),0.0);}
-   circuit_open=GlobalVariableCheck(AccountStateKey("lock")) && GlobalVariableGet(AccountStateKey("lock"))>0.5;
+   trade.SetExpertMagicNumber(MagicNumber);trade.SetTypeFillingBySymbol(_Symbol);current_server_day=DayStart(TimeCurrent());
+   LoadState(AccountInfoDouble(ACCOUNT_EQUITY));
+   circuit_open=daily_lock||total_lock;
+   PersistIfNeeded(true);
    if(GlobalVariableCheck(SignalStateKey()))last_signal_epoch=GlobalVariableGet(SignalStateKey());
+   CheckCircuit();   // trip immediately on restart if floating loss already breaches a limit
    EventSetTimer(PollSeconds);return INIT_SUCCEEDED;
 }
-void OnDeinit(const int reason){EventKillTimer();}
+void OnDeinit(const int reason){PersistIfNeeded(true);EventKillTimer();}
 void OnTick(){CheckCircuit();ManageBreakeven();}
 void OnTimer()
 {

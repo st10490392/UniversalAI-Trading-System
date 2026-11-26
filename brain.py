@@ -4,7 +4,7 @@ MT5 and Groq are optional adapters. This service never places orders; execution
 and a second drawdown circuit breaker belong to the EA. See README.md for contracts.
 """
 from __future__ import annotations
-import json, logging, os, random, secrets, sqlite3, threading, time
+import json, logging, math, os, random, re, secrets, sqlite3, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -23,7 +23,9 @@ ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
 DB_PATH=Path(os.getenv("UNIVERSALAI_DB",ROOT/"accounts.db"))
 SYMBOLS=[s.strip() for s in os.getenv("MT5_SYMBOLS","EURUSD,XAUUSD,Volatility 75 Index,Boom 1000 Index,Crash 1000 Index").split(",") if s.strip()]
-MODEL=os.getenv("GROQ_MODEL","qwen/qwen3-32b")
+MODEL=os.getenv("GROQ_MODEL","qwen/qwen3.8-27b")
+LEVEL_TOLERANCE=float(os.getenv("UNIVERSALAI_LEVEL_TOLERANCE","0.10"))
+_THINK_RE=re.compile(r"<think>.*?</think>",re.S|re.I)
 LOG=logging.getLogger("universalai")
 @asynccontextmanager
 async def lifespan(_app):
@@ -76,14 +78,21 @@ class LicenseContext(BaseModel):
     license_key:str
     device_id:str
 
+def _expired(raw:str)->bool:
+    try:exp=datetime.fromisoformat(raw)
+    except (TypeError,ValueError):return True
+    if exp.tzinfo is None:exp=exp.replace(tzinfo=timezone.utc)
+    return exp<=datetime.now(timezone.utc)
+
 def _valid_license(license_key:str,account_id:str,device_id:str|None=None,bind:bool=False)->bool:
     key=license_key.strip().upper()
     if not key or not account_id:return False
+    if device_id is not None and len(device_id.strip())<8:return False
     with _connect() as c:
         if bind:c.execute("BEGIN IMMEDIATE")
         row=c.execute("SELECT * FROM licenses WHERE license_key=?",(key,)).fetchone()
         if not row or not row["is_active"]:return False
-        if row["expires_at"] and datetime.fromisoformat(row["expires_at"])<=datetime.now(timezone.utc):return False
+        if row["expires_at"] and _expired(row["expires_at"]):return False
         if row["bound_account_id"] and row["bound_account_id"]!=account_id:return False
         if device_id is not None:
             if row["bound_device_id"] and row["bound_device_id"]!=device_id:return False
@@ -92,6 +101,14 @@ def _valid_license(license_key:str,account_id:str,device_id:str|None=None,bind:b
         elif not row["bound_account_id"] or not row["bound_device_id"]:
             return False
         return True
+
+def _ea_authorized(key:str,account_id:str,device_id:str)->bool:
+    """EA polls: key must be active/unexpired/bound. If the EA sends X-Device-ID it must match the claimed device;
+    set UNIVERSALAI_REQUIRE_EA_DEVICE=1 to make the header mandatory."""
+    if not _valid_license(key,account_id):return False
+    dev=device_id.strip()
+    if dev:return _valid_license(key,account_id,dev)
+    return os.getenv("UNIVERSALAI_REQUIRE_EA_DEVICE","0")!="1"
 
 def require_dashboard_license(x_license_key:str=Header(default=""),x_license_account_id:str=Header(default=""),x_device_id:str=Header(default=""))->LicenseContext:
     if not _valid_license(x_license_key,x_license_account_id,x_device_id,bind=True):raise HTTPException(403,"License activation is invalid or bound to another account/device")
@@ -185,22 +202,57 @@ def in_kill_zone(now:datetime|None=None)->bool:
     now=now or datetime.now(timezone.utc); m=now.hour*60+now.minute
     return 420<=m<600 or 720<=m<960
 
+def _reject_constant(name:str)->float:raise ValueError("non-finite JSON constant "+name)
+
+def _finite(v:Any)->float:
+    if isinstance(v,bool) or not isinstance(v,(int,float)) or not math.isfinite(float(v)):raise ValueError("non-finite or non-numeric field")
+    return float(v)
+
+def _parse_model_json(content:Any)->dict[str,Any]:
+    """Strict parse: drop complete <think> blocks, reject unterminated ones, NaN/Infinity, trailing text and non-objects."""
+    if not isinstance(content,str):raise ValueError("empty model content")
+    text=_THINK_RE.sub("",content).strip()
+    if re.search(r"</?think>",text,re.I):raise ValueError("unterminated think block")
+    text=re.sub(r"^```(?:json)?\s*|\s*```$","",text,flags=re.I).strip()
+    out=json.loads(text,parse_constant=_reject_constant)
+    if not isinstance(out,dict):raise ValueError("model JSON is not an object")
+    return out
+
 def groq_decision(context:dict[str,Any])->dict[str,Any]:
     key=os.getenv("GROQ_API_KEY","").strip()
     if not key:raise RuntimeError("GROQ_API_KEY is not configured")
     schema={"decision":"BUY|SELL|WAIT","entry":"number","sl":"number","tp":"number","confidence":"number","reason":"string"}
     prompt="Return only a JSON object matching "+json.dumps(schema)+". Do not change setup side; uncertain means WAIT. Context: "+json.dumps(context)
-    r=requests.post("https://api.groq.com/openai/v1/chat/completions",timeout=25,headers={"Authorization":"Bearer "+key},json={"model":MODEL,"messages":[{"role":"user","content":prompt}],"temperature":.1,"response_format":{"type":"json_object"}})
-    r.raise_for_status(); out=json.loads(r.json()["choices"][0]["message"]["content"])
-    if out.get("decision") not in ("BUY","SELL","WAIT"):raise ValueError("Invalid model decision")
-    for k in ("entry","sl","tp","confidence"):out[k]=float(out[k])
-    out["reason"]=str(out.get("reason",""))[:1000]; return out
+    body={"model":MODEL,"messages":[{"role":"user","content":prompt}],"temperature":.1,"max_completion_tokens":4096,"response_format":{"type":"json_object"}}
+    if "qwen" in MODEL.lower():body["reasoning_format"]="hidden"  # Groq: "raw" + JSON mode returns 400; hidden/parsed are valid
+    r=requests.post("https://api.groq.com/openai/v1/chat/completions",timeout=(3.05,20),headers={"Authorization":"Bearer "+key},json=body)
+    r.raise_for_status(); choice=r.json()["choices"][0]
+    if choice.get("finish_reason")!="stop":raise ValueError("incomplete model output: "+str(choice.get("finish_reason")))
+    out=_parse_model_json(choice["message"]["content"])
+    decision=out.get("decision")
+    if decision not in ("BUY","SELL","WAIT"):raise ValueError("Invalid model decision")
+    reason=str(out.get("reason",""))[:1000]
+    if decision=="WAIT":return {"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":reason}
+    # Whitelist: model-supplied extra keys must never reach the EA payload.
+    return {"decision":decision,"entry":_finite(out.get("entry")),"sl":_finite(out.get("sl")),"tp":_finite(out.get("tp")),"confidence":_finite(out.get("confidence")),"reason":reason}
 
 def validate_decision(result:dict[str,Any],side:str)->bool:
-    if result.get("decision")!=side or not .75<=result.get("confidence",0)<=1:return False
-    e,sl,tp=result["entry"],result["sl"],result["tp"]
+    try:c,e,sl,tp=(float(result[k]) for k in ("confidence","entry","sl","tp"))
+    except (KeyError,TypeError,ValueError):return False
+    if result.get("decision")!=side or not all(math.isfinite(v) for v in (c,e,sl,tp)) or min(e,sl,tp)<=0 or not .75<=c<=1:return False
     directional=(side=="BUY" and sl<e<tp) or (side=="SELL" and tp<e<sl)
     return bool(directional and abs(e-sl)>0 and abs(tp-e)/abs(e-sl)>=2.5)
+
+def levels_match_setup(result:dict[str,Any],setup:Any)->bool:
+    """The model may veto a setup, not re-price it: entry/SL/TP must sit within LEVEL_TOLERANCE x risk of the deterministic setup."""
+    try:
+        ref,stop,target=(float(setup[k]) for k in ("entry_reference","stop","target"))
+        e,sl,tp=(float(result[k]) for k in ("entry","sl","tp"))
+    except (KeyError,TypeError,ValueError):return False
+    risk=abs(ref-stop)
+    if not all(math.isfinite(v) for v in (ref,stop,target,e,sl,tp)) or risk<=0:return False
+    tol=risk*LEVEL_TOLERANCE
+    return abs(e-ref)<=tol and abs(sl-stop)<=tol and abs(tp-target)<=tol
 
 def _mt5_rates(symbol:str,timeframe:str,count:int=300)->pd.DataFrame|None:
     try:import MetaTrader5 as mt5
@@ -216,7 +268,8 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
         approval_doc=json.loads(APPROVED_PATH.read_text(encoding="utf-8"))
     except (OSError,ValueError):
         approval_doc={"approved":[]}
-    records=[r for r in approval_doc.get("approved",[]) if r.get("symbol")==symbol]
+    approved=approval_doc.get("approved") if isinstance(approval_doc,dict) else None
+    records=[r for r in (approved if isinstance(approved,list) else []) if isinstance(r,dict) and r.get("symbol")==symbol]
     strategy_names=tuple(sorted({str(r.get("strategy")) for r in records if r.get("strategy") in RESEARCH_STRATEGIES.values()}))
     # Fail closed until this exact symbol has passed the OOS/Monte Carlo gate.
     if not strategy_names:return None
@@ -246,8 +299,8 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
         except Exception as exc:
             LOG.exception("Decision generation failed for %s / %s",symbol,candidate["strategy"])
             proposed={"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":"Decision unavailable: "+type(exc).__name__}
-        if not validate_decision(proposed,side):proposed["decision"]="WAIT"
-        proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
+        if not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):proposed["decision"]="WAIT"
+        proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"bar_time":bar_time,"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
         decision=proposed
         if decision["decision"] in ("BUY","SELL"):break
     if decision is None and candidates==[]:
@@ -354,16 +407,19 @@ def logs(account_id:str,limit:int=Query(50,ge=1,le=200),auth:LicenseContext=Depe
     with _connect() as c:return [dict(r) for r in c.execute("SELECT * FROM trade_logs WHERE account_id=? ORDER BY id DESC LIMIT ?",(account_id,limit))]
 
 @app.get("/api/ea/poll/{account_id}/{symbol}")
-def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default="")):
+def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default=""),x_device_id:str=Header(default="")):
     init_db()
-    if not _valid_license(x_license_key,account_id):return {"command":"UNAUTHORIZED"}
+    if not _ea_authorized(x_license_key,account_id,x_device_id):return {"command":"UNAUTHORIZED"}
     with _connect() as c:
         a=c.execute("SELECT * FROM accounts WHERE account_id=?",(account_id,)).fetchone()
         if not a:raise HTTPException(404,"Account not configured")
         c.execute("INSERT INTO account_state(account_id,balance,equity) VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET balance=excluded.balance,equity=excluded.equity,updated_at=CURRENT_TIMESTAMP",(account_id,balance,equity))
     if not a["active"]:return {"decision":"WAIT","reason":"Account stopped","risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
-    with _scanner_lock:result=analyze_symbol(symbol,account_id)
+    with _scanner_lock:
+        try:result=analyze_symbol(symbol,account_id)
+        except Exception:LOG.exception("analyze_symbol failed for %s",symbol);result=None
     if not result or result["decision"] not in ("BUY","SELL"):return {"decision":"WAIT","reason":"No qualified setup","risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
+    result=dict(result)  # never mutate the per-symbol cache shared across accounts/threads
     result.update({"execution_delay_seconds":random.randint(3,15) if a["account_type"]=="prop" else 0,"tp_offset_points":random.uniform(1,3) if a["account_type"]=="prop" else 0,"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]})
     return result
 
