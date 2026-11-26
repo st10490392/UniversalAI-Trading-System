@@ -103,6 +103,10 @@ Both in-sample (2020–2023) and out-of-sample (2024–2025) statistics are save
 
 See [`docs/research_validation_audit.md`](docs/research_validation_audit.md) for the independent Monte Carlo, backtester, XGBoost, walk-forward, and cost-model audit. The audit's reproduced and corrected outputs live under ignored `data/research_audit_2026_11/`; they do not overwrite the original research reports or approval file. In particular, Monte Carlo “ruin” is the probability of breaching either the 5% daily or 10% total drawdown limit, not a probability of account equity reaching zero. The audit keeps `approved_strategies.json` empty until existing approval requirements pass.
 
+## Deterministic strategy module
+
+`strategies.py` provides `session_orb_retest` and `ema_trend_pullback` for callers that pass completed OHLC bars. Both return `BUY`, `SELL`, or fail-closed `WAIT` dictionaries and do not route trades. `PairPerformanceFilter` is an in-memory research filter. `research_lab.py` exports its results to `performance_filter_registry.json` and `.csv`; this registry is review-only and never changes `approved_strategies.json` or the live `brain.py` strategy allow-list.
+
 Costs use exported bar spreads, adverse slippage (2 points by default), and a default $7 round-turn commission per standard lot when MT5 tick-value metadata is available; otherwise the configurable commission-point fallback applies. Historical tick values/contracts may differ from historical broker terms, and OHLC bars cannot reproduce queue position, swaps, financing, liquidity gaps, or partial fills. Review the full run metadata and drawdowns before enabling an approved strategy. `xgboost` is listed in `requirements.txt`; if it is unavailable, strategies A–C still run and D is explicitly marked unavailable rather than silently replaced with another classifier.
 
 ## Verification

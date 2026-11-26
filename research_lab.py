@@ -19,6 +19,8 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from strategies import PairPerformanceFilter
+
 ROOT = Path(__file__).resolve().parent
 DATA_DEFAULT = ROOT / "data" / "history_2020_2025"
 OUT_DEFAULT = ROOT / "data" / "research_2020_2025"
@@ -368,6 +370,26 @@ def _loss_streak_rows(symbol:str,strategy:str,strategy_id:str)->list[dict[str,An
     return rows
 
 
+def performance_filter_registry(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Create a review-only performance registry; never alters live approvals.
+
+    A pair without the required adverse-cost stress run is intentionally blocked.
+    """
+    filter_ = PairPerformanceFilter()
+    for result in results:
+        oos = result.get("oos") or {}
+        stress = result.get("stress") or []
+        adverse = next((row for row in stress if row.get("scenario") == "combined_adverse_costs"), None)
+        metrics = {
+            "trades": oos.get("trades"),
+            "pf": oos.get("profit_factor"),
+            "max_dd_pct": oos.get("max_drawdown_pct"),
+            "cost_stressed_pf": adverse.get("profit_factor") if adverse else None,
+        }
+        filter_.evaluate_metrics(str(result.get("symbol", "")), str(result.get("strategy", "")), metrics)
+    return filter_.get_registry_export()
+
+
 def _feature_matrix(d: pd.DataFrame, indices: np.ndarray) -> np.ndarray:
     return d.loc[indices,list(FEATURES)].replace([np.inf,-np.inf],np.nan).fillna(0).to_numpy(float)
 
@@ -570,6 +592,12 @@ def main() -> int:
     streak_rows=[row for r in results if r.get("monte_carlo") for row in _loss_streak_rows(r["symbol"],r["strategy"],r["strategy_id"])]
     with (args.output_dir/"loss_streak_stress.csv").open("w",newline="",encoding="utf-8") as f:
         fields=sorted({k for row in streak_rows for k in row});w=__import__("csv").DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(streak_rows)
+    registry = performance_filter_registry(results)
+    (args.output_dir/"performance_filter_registry.json").write_text(json.dumps(registry,indent=2,allow_nan=False),encoding="utf-8")
+    with (args.output_dir/"performance_filter_registry.csv").open("w",newline="",encoding="utf-8") as f:
+        fields=("symbol","strategy","approved","regime","failures")
+        w=__import__("csv").DictWriter(f,fieldnames=fields);w.writeheader()
+        for row in registry:w.writerow({**row,"failures":"; ".join(row["failures"])})
     qualified=[r for r in results if r.get("monte_carlo") is not None]
     approved=[r for r in approved if r["monte_carlo"]["probability_either_limit_breach_pct"]<=args.max_ruin_pct and r["monte_carlo"]["p95_max_drawdown_pct"]<=args.max_p95_drawdown_pct]
     payload={"generated_at":datetime.now(timezone.utc).isoformat(),"period":{"in_sample":"2020-01-01/2023-12-31","out_of_sample":"2024-01-01/2025-12-31"},"walk_forward":{"test_windows":[[x[0],x[1],x[2]] for x in WF_WINDOWS],"d_role":"2024 validation reporting only; 2025 final test; fixed threshold, no retuning"},"approval_criteria":{"oos_profit_factor_min":args.mc_min_pf,"oos_trade_count_min":args.mc_min_trades,"monte_carlo_iterations":args.mc_iterations,"risk_per_trade_pct":args.mc_risk_pct,"prop_daily_drawdown_pct":DAILY_DD_LIMIT_PCT,"prop_total_drawdown_pct":TOTAL_DD_LIMIT_PCT,"max_either_limit_breach_probability_pct":args.max_ruin_pct,"max_p95_drawdown_pct":args.max_p95_drawdown_pct},"monte_carlo_qualified":qualified,"approved":approved}
