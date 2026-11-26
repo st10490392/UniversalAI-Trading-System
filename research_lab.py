@@ -19,7 +19,7 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from strategies import PairPerformanceFilter
+from strategies import PairPerformanceFilter, _nonnegative_number
 
 ROOT = Path(__file__).resolve().parent
 DATA_DEFAULT = ROOT / "data" / "history_2020_2025"
@@ -289,7 +289,7 @@ def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray
     return trades
 
 
-def _stats(trades: list[dict[str,Any]], risk_pct: float=.75, *, durations: list[int]|None=None) -> dict[str,Any]:
+def _stats(trades: list[dict[str,Any]], risk_pct: float=.75, *, durations: list[int]|None=None, apply_drawdown_stops: bool=True) -> dict[str,Any]:
     eq=peak=1.0; maxdd=0.0; day_start=1.0; day_key=None; stopped_days=set(); stopped=False; month_ends={}; executed=[]
     for t in trades:
         r=float(t["r"])
@@ -299,14 +299,72 @@ def _stats(trades: list[dict[str,Any]], risk_pct: float=.75, *, durations: list[
         executed.append(r)
         if durations is not None:durations.append(t["bars_held"])
         eq*=max(0.0,1.0+r*risk_pct/100.0); peak=max(peak,eq); dd=(peak-eq)/peak*100; maxdd=max(maxdd,dd)
-        if (day_start-eq)/max(day_start,1e-12)*100>=DAILY_DD_LIMIT_PCT: stopped_days.add(day)
-        if dd>=TOTAL_DD_LIMIT_PCT: stopped=True
+        if apply_drawdown_stops:
+            if (day_start-eq)/max(day_start,1e-12)*100>=DAILY_DD_LIMIT_PCT: stopped_days.add(day)
+            if dd>=TOTAL_DD_LIMIT_PCT: stopped=True
         month_ends[month]=eq
     rs=np.asarray(executed,dtype=float)
     wins=rs[rs>0].sum(); losses=-rs[rs<0].sum(); pf=float(wins/losses) if losses>0 else (None if wins>0 else 0.0)
     vals=list(month_ends.values()); mrets=[]; prev=1.0
-    for value in vals: mrets.append(value/prev-1);prev=value
+    for value in vals:
+        if prev>0:mrets.append(value/prev-1)
+        prev=value
     return {"trades":len(executed),"win_rate_pct":float((rs>0).mean()*100) if len(rs) else 0.0,"profit_factor":pf,"total_return_pct":(eq-1)*100,"max_drawdown_pct":maxdd,"average_monthly_return_pct":float(np.mean(mrets)*100) if mrets else 0.0,"sharpe_ratio":float(np.mean(mrets)/np.std(mrets,ddof=1)*math.sqrt(12)) if len(mrets)>1 and np.std(mrets,ddof=1)>0 else 0.0}
+
+
+STANDARD_RISK_PCT = 1.0
+STANDARD_MIN_TRADES = 50
+STANDARD_MIN_STRESSED_PF = 1.15
+STANDARD_MAX_DRAWDOWN_PCT = 20.0
+
+
+def standard_trade_stats(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Replay all simulated trades at 1% compounded risk for strategy discovery."""
+    stats = _stats(trades, risk_pct=STANDARD_RISK_PCT, apply_drawdown_stops=False)
+    stats["average_r"] = math.fsum(float(trade["r"]) for trade in trades) / len(trades) if trades else 0.0
+    return stats
+
+
+def standard_qualification(baseline: dict[str, Any], stress: dict[str, Any]) -> dict[str, Any]:
+    failures = []
+    for label, stats in (("baseline", baseline), ("stress", stress)):
+        if stats["trades"] < STANDARD_MIN_TRADES:
+            failures.append(f"{label} trades below {STANDARD_MIN_TRADES}")
+        expectancy = stats["average_r"]
+        if not _nonnegative_number(expectancy) or expectancy == 0:
+            failures.append(f"{label} expectancy must be positive")
+        drawdown = stats["max_drawdown_pct"]
+        if not _nonnegative_number(drawdown) or drawdown > STANDARD_MAX_DRAWDOWN_PCT:
+            failures.append(f"{label} drawdown exceeds {STANDARD_MAX_DRAWDOWN_PCT:g}% or is unavailable")
+    pf = stress["profit_factor"]
+    if not _nonnegative_number(pf) or pf < STANDARD_MIN_STRESSED_PF:
+        failures.append(f"stressed PF below {STANDARD_MIN_STRESSED_PF:g} or unavailable")
+    return {"standard_pass": not failures, "failures": failures, "live_approval": False}
+
+
+def evaluate_prop_execution_profile(
+    *,
+    max_floating_drawdown_pct: float | None = None,
+    best_day_profit_share_pct: float | None = None,
+    minimum_hold_minutes: float | None = None,
+) -> dict[str, Any]:
+    """Screen measured execution metrics independently of discovery.
+
+    Consistency means best profitable day's net P&L divided by total net
+    profit for the evaluation period. Unknown metrics prevent a verified pass.
+    """
+    failures, unavailable = [], []
+    for name, value, limit in (
+        ("floating drawdown", max_floating_drawdown_pct, 1.0),
+        ("best day profit share", best_day_profit_share_pct, 15.0),
+        ("minimum hold", minimum_hold_minutes, 2.0),
+    ):
+        if not _nonnegative_number(value):
+            unavailable.append(name)
+        elif (value <= limit if name == "minimum hold" else value > limit):
+            failures.append(name)
+    status = "fail" if failures else "unverified" if unavailable else "pass"
+    return {"status": status, "failures": failures, "unavailable": unavailable, "live_approval": False}
 
 
 WF_WINDOWS=(

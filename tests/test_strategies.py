@@ -156,3 +156,52 @@ def test_default_research_output_does_not_touch_live_approval(tmp_path, monkeypa
     assert json.loads((output / "approved_candidates.json").read_text())["approved"] == []
     sys.argv.extend(["--approved-path", str(live)])
     assert research_lab.main() == 0 and live.exists()
+
+
+def test_standard_research_replays_trades_past_legacy_drawdown_stop():
+    from research_lab import _stats, standard_trade_stats
+
+    trades = [{"time": "2025-01-01", "r": -1.0}] * 12 + [{"time": "2025-01-02", "r": 1.5}] * 8
+    assert _stats(trades)["trades"] < len(trades)
+    standard = standard_trade_stats(trades)
+    assert standard["trades"] == len(trades)
+    assert standard["average_r"] == 0.0
+    assert standard["max_drawdown_pct"] == pytest.approx((1 - .99 ** 12) * 100)
+
+
+@pytest.mark.parametrize(("overrides", "passes"), [
+    ({}, True),
+    ({"trades": 49}, False),
+    ({"profit_factor": 1.1499}, False),
+    ({"average_r": 0.0}, False),
+    ({"max_drawdown_pct": 20.0001}, False),
+    ({"max_drawdown_pct": float("nan")}, False),
+])
+def test_standard_qualification_boundaries_ignore_hold_time(overrides, passes):
+    from research_lab import standard_qualification
+
+    stats = {"trades": 50, "average_r": .1, "profit_factor": 1.15,
+             "max_drawdown_pct": 20.0, "holds_not_verified_gt_2": 50}
+    result = standard_qualification(stats, {**stats, **overrides})
+    assert result["standard_pass"] is passes
+    assert result["live_approval"] is False
+    assert bool(result["failures"]) is not passes
+    assert not standard_qualification({**stats, "average_r": -.1}, stats)["standard_pass"]
+
+
+@pytest.mark.parametrize(("override", "status", "failure"), [
+    ({}, "pass", None),
+    ({"max_floating_drawdown_pct": 1.001}, "fail", "floating drawdown"),
+    ({"best_day_profit_share_pct": 15.001}, "fail", "best day profit share"),
+    ({"minimum_hold_minutes": 2.0}, "fail", "minimum hold"),
+    ({"minimum_hold_minutes": None}, "unverified", None),
+    ({"max_floating_drawdown_pct": False}, "unverified", None),
+])
+def test_optional_prop_execution_profile(override, status, failure):
+    from research_lab import evaluate_prop_execution_profile
+
+    measured = {"max_floating_drawdown_pct": 1.0, "best_day_profit_share_pct": 15.0, "minimum_hold_minutes": 2.001}
+    result = evaluate_prop_execution_profile(**{**measured, **override})
+    assert result["status"] == status
+    assert result["failures"] == ([failure] if failure else [])
+    assert result["live_approval"] is False

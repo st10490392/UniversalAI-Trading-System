@@ -8,7 +8,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from research_lab import ROOT, _causal_spreads, _stats, load_history, simulate
+from research_lab import ROOT, _causal_spreads, load_history, simulate, standard_qualification, standard_trade_stats
 from strategies import ema_trend_pullback, session_orb_retest, validate_signal
 
 
@@ -47,6 +47,7 @@ def evaluate_file(path: Path, lookback: int = 80, since: str | None = None):
     end = (data.time.iloc[-1].normalize() + pd.Timedelta(days=1)).date().isoformat()
     for strategy in (session_orb_retest, ema_trend_pullback):
         signals = build_research_signals(data, strategy, lookback)
+        results = []
         for scenario, spread, slip, commission_scale in (
             ("baseline", 1.0, 2.0, 1.0),
             ("combined_adverse_costs", 2.0, 5.0, 1.5),
@@ -55,16 +56,19 @@ def evaluate_file(path: Path, lookback: int = 80, since: str | None = None):
                               spread_multiplier=spread, slippage_points=slip,
                               commission_per_lot=7.0 * commission_scale,
                               commission_points=commission_scale)
-            durations: list[int] = []
-            stats = _stats(trades, durations=durations)
-            yield {
+            durations = [trade["bars_held"] for trade in trades]
+            stats = standard_trade_stats(trades)
+            results.append({
                 "source": path.name, "symbol": data.attrs["symbol"], "strategy": strategy.__name__,
                 "scenario": scenario, "start_utc": start, "end_exclusive_utc": end,
                 "lookback_bars": lookback, "live_approval": False, **stats,
                 "median_bars_held": float(np.median(durations)) if durations else None,
                 "p95_bars_held": float(np.percentile(durations, 95)) if durations else None,
                 "max_bars_held": max(durations, default=None),
-            }
+            })
+        qualification = standard_qualification(*results)
+        for row in results:
+            yield {**row, **qualification}
 
 
 def main() -> int:
