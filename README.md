@@ -86,6 +86,21 @@ python backtest.py .\EURUSD_M15.csv --symbol EURUSD --risk-pct 1 --daily-dd 4 --
 
 CSV timestamps must be UTC. An `MT5` export from broker time must be converted before backtesting.
 
+## 2020–2025 quantitative research lab
+
+`fetch_history.py` connects to the already-running MT5 terminal and refuses to harvest unless the current account is a demo account. It scans visible Market Watch symbols for the configured Forex/gold, index aliases, and Deriv synthetic families, tags each CSV as `forex`, `index`, or `synthetic`, and streams half-year chunks to `data/history_2020_2025/`. The end date is exclusive `2026-01-01`; the terminal only returns bars the broker has made available, so `manifest.json` records the actual first and last bar for each symbol. Increase MT5's **Max bars in chart**, open the desired symbols, and allow the terminal to download history before running it again if the broker returns a shorter window.
+
+```powershell
+python fetch_history.py
+python research_lab.py
+```
+
+The research runner evaluates four independent M15 families: (A) 12/26 EMA cross with RSI, ATR expansion and a +1.2R breakeven stop; (B) FX/index London and New York session Judas/FVG logic and session-free synthetic structural/breakout logic; (C) Bollinger/Keltner squeeze, 50-bar z-score and ER mean reversion; and (D) 20-bar volatility breakouts with an XGBoost classifier trained only on labelled 2020–2023 candidates and applied to 2024–2025 candidates. D's in-sample statistics show the raw breakout training-label pool, not fitted-model training accuracy. London/NY time windows use IANA time zones and handle daylight-saving transitions. Synthetic symbols never enter the session-filter path.
+
+Both in-sample (2020–2023) and out-of-sample (2024–2025) statistics are saved in ignored local files under `data/research_2020_2025/`. Every OOS pair with PF >= 1.25 and at least 80 trades receives a 1,000-order reshuffle Monte Carlo at 0.75% risk, with 5% daily and 10% peak-to-trough total drawdown stops. All such rows go in `monte_carlo_qualified`; the live `approved` list additionally requires ruin probability <= 5% and 95th-percentile drawdown <= 10% (both configurable CLI flags). The dashboard displays only this stricter list and `brain.py` fails closed for symbols/strategies absent from it. Qwen receives the current approved setup and indicator values as a final sanity check. For Strategy D live use, the matching XGBoost model JSON must also be present under `data/research_2020_2025/models/`.
+
+Costs use exported bar spreads, adverse slippage (2 points by default), and a default $7 round-turn commission per standard lot when MT5 tick-value metadata is available; otherwise the configurable commission-point fallback applies. Historical tick values/contracts may differ from historical broker terms, and OHLC bars cannot reproduce queue position, swaps, financing, liquidity gaps, or partial fills. Review the full run metadata and drawdowns before enabling an approved strategy. `xgboost` is listed in `requirements.txt`; if it is unavailable, strategies A–C still run and D is explicitly marked unavailable rather than silently replaced with another classifier.
+
 ## Verification
 
 Run `python -m pytest`. Tests use synthetic fixtures and temporary SQLite storage; they do not claim profitability, Groq connectivity, or live order placement. Test EA behavior on a demo terminal before considering any funded account. The server's EA poll route is not protected by an additional network token; license validation and loopback/private network deployment are required.

@@ -53,6 +53,9 @@ string JsonString(const string json,const string key)
 double JsonNumber(const string json,const string key,const double fallback)
 { string s=JsonString(json,key); if(s=="")return fallback; return StringToDouble(s); }
 
+string PositionRiskKey(const ulong ticket,const string suffix)
+{ return "UAI_"+(string)AccountInfoInteger(ACCOUNT_LOGIN)+"_"+(string)MagicNumber+"_"+(string)ticket+"_"+suffix; }
+
 datetime DayStart(datetime t)
 { MqlDateTime x;TimeToStruct(t,x);x.hour=0;x.min=0;x.sec=0;return StructToTime(x); }
 
@@ -95,6 +98,29 @@ double RiskLots(const ENUM_ORDER_TYPE type,const double entry,const double sl)
    if(!OrderCalcProfit(type,_Symbol,1.0,entry,sl,profit))return 0.0;
    double loss=MathAbs(profit);if(loss<=0.0)return 0.0;
    return NormalizeLots(risk_money/loss);
+}
+
+void ManageBreakeven()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      ulong ticket=PositionGetTicket(i);if(ticket==0)continue;
+      if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber || PositionGetString(POSITION_SYMBOL)!=_Symbol)continue;
+      string risk_key=PositionRiskKey(ticket,"risk"),trigger_key=PositionRiskKey(ticket,"be");
+      if(!GlobalVariableCheck(risk_key) || !GlobalVariableCheck(trigger_key))continue;
+      double risk=GlobalVariableGet(risk_key),trigger=GlobalVariableGet(trigger_key);
+      if(risk<=0.0 || trigger<=0.0)continue;
+      ENUM_POSITION_TYPE side=(ENUM_POSITION_TYPE)PositionGetInteger(POSITION_TYPE);
+      double entry=PositionGetDouble(POSITION_PRICE_OPEN),sl=PositionGetDouble(POSITION_SL),tp=PositionGetDouble(POSITION_TP);
+      double market=(side==POSITION_TYPE_BUY)?SymbolInfoDouble(_Symbol,SYMBOL_BID):SymbolInfoDouble(_Symbol,SYMBOL_ASK);
+      bool reached=(side==POSITION_TYPE_BUY)?market-entry>=trigger*risk:entry-market>=trigger*risk;
+      bool already=(side==POSITION_TYPE_BUY)?sl>=entry:sl>0.0 && sl<=entry;
+      double min_stop=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
+      if(!reached || already || MathAbs(market-entry)<min_stop)continue;
+      int digits=(int)SymbolInfoInteger(_Symbol,SYMBOL_DIGITS);
+      if(!trade.PositionModify(ticket,NormalizeDouble(entry,digits),tp))
+         Print("UniversalAI breakeven modify failed ticket=",ticket," retcode=",trade.ResultRetcode());
+   }
 }
 
 bool SendPoll(string &response)
@@ -160,7 +186,23 @@ void ExecuteSignal(const string json)
    double lots=RiskLots(type,entry,sl);if(lots<=0){Print("Risk lot calculation failed for ",sid);return;}
    trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);
    bool ok=(decision=="BUY")?trade.Buy(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid):trade.Sell(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid);
-   if(ok){RememberSignal(sid);pending_signal_id="";}
+   if(ok)
+   {
+      double be=JsonNumber(json,"breakeven_at_r",0.0);
+      if(be>0.0)
+      {
+         for(int i=PositionsTotal()-1;i>=0;i--)
+         {
+            ulong ticket=PositionGetTicket(i);if(ticket==0)continue;
+            if(PositionGetInteger(POSITION_MAGIC)!=MagicNumber || PositionGetString(POSITION_SYMBOL)!=_Symbol)continue;
+            double position_entry=PositionGetDouble(POSITION_PRICE_OPEN),position_sl=PositionGetDouble(POSITION_SL);
+            string risk_key=PositionRiskKey(ticket,"risk"),trigger_key=PositionRiskKey(ticket,"be");
+            if(!GlobalVariableCheck(risk_key))GlobalVariableSet(risk_key,MathAbs(position_entry-position_sl));
+            GlobalVariableSet(trigger_key,be);
+         }
+      }
+      RememberSignal(sid);pending_signal_id="";
+   }
    else Print("Order failed ",sid," retcode=",trade.ResultRetcode()," ",trade.ResultRetcodeDescription());
 }
 
@@ -191,7 +233,7 @@ int OnInit()
    EventSetTimer(PollSeconds);return INIT_SUCCEEDED;
 }
 void OnDeinit(const int reason){EventKillTimer();}
-void OnTick(){CheckCircuit();}
+void OnTick(){CheckCircuit();ManageBreakeven();}
 void OnTimer()
 {
    CheckCircuit();

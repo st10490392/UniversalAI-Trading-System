@@ -17,6 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse
 from fastapi import Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
+from research_lab import STRATEGIES as RESEARCH_STRATEGIES, live_candidates
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
@@ -31,7 +32,8 @@ async def lifespan(_app):
 
 app=FastAPI(title="UniversalAI Trading API",version="1.0.0",lifespan=lifespan)
 _scanner_lock=threading.Lock()
-_analysis_cache:dict[str,tuple[int,dict[str,Any]|None]]={}
+_analysis_cache:dict[str,tuple[int,tuple[str,...],dict[str,Any]|None]]={}
+APPROVED_PATH=Path(os.getenv("UNIVERSALAI_APPROVED_PATH",ROOT/"approved_strategies.json"))
 
 def _connect():
     c=sqlite3.connect(DB_PATH,timeout=10); c.row_factory=sqlite3.Row; c.execute("PRAGMA journal_mode=WAL"); return c
@@ -210,28 +212,50 @@ def _mt5_rates(symbol:str,timeframe:str,count:int=300)->pd.DataFrame|None:
     return pd.DataFrame(raw)
 
 def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->dict[str,Any]|None:
-    m15,h1=_mt5_rates(symbol,"M15"),_mt5_rates(symbol,"H1")
-    if m15 is None or h1 is None:return None
+    try:
+        approval_doc=json.loads(APPROVED_PATH.read_text(encoding="utf-8"))
+    except (OSError,ValueError):
+        approval_doc={"approved":[]}
+    records=[r for r in approval_doc.get("approved",[]) if r.get("symbol")==symbol]
+    strategy_names=tuple(sorted({str(r.get("strategy")) for r in records if r.get("strategy") in RESEARCH_STRATEGIES.values()}))
+    # Fail closed until this exact symbol has passed the OOS/Monte Carlo gate.
+    if not strategy_names:return None
+    m15=_mt5_rates(symbol,"M15")
+    if m15 is None:return None
     bar_time=int(m15.time.iloc[-1]) if "time" in m15.columns else int(time.time()//900)
+    signature=strategy_names+(str(APPROVED_PATH.stat().st_mtime_ns) if APPROVED_PATH.exists() else "missing",)
     cached=_analysis_cache.get(symbol)
-    if cached and cached[0]==bar_time:
-        result=cached[1]
+    if cached and cached[0]==bar_time and cached[1]==signature:
+        result=cached[2]
         if result and account_id and result.get("decision") in ("BUY","SELL"):
             with _connect() as c:c.execute("INSERT OR IGNORE INTO trade_logs(account_id,symbol,signal_id,decision,confidence,reason,signal_json) VALUES(?,?,?,?,?,?,?)",(account_id,symbol,result["signal_id"],result["decision"],result["confidence"],result["reason"],json.dumps(result)))
         return result
-    bias=market_bias(h1); setup=detect_smc(m15,bias)
-    if not setup or (not is_synthetic(symbol) and not in_kill_zone(now)):
-        _analysis_cache[symbol]=(bar_time,None);return None
-    metrics=quant_metrics(m15)
-    if not quant_allows(metrics,setup["side"]):_analysis_cache[symbol]=(bar_time,None);return None
-    try:decision=groq_decision({"symbol":symbol,"bias":bias,"setup":setup,"quant":metrics,"last_close":float(m15.close.iloc[-1])})
-    except Exception as exc:
-        LOG.exception("Decision generation failed for %s",symbol);decision={"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":"Decision unavailable: "+type(exc).__name__}
-    if not validate_decision(decision,setup["side"]):decision["decision"]="WAIT"
-    decision.update({"symbol":symbol,"bias":bias,"quant":metrics,"setup":setup,"signal_id":f"{symbol}-{bar_time}"})
-    _analysis_cache[symbol]=(bar_time,decision)
+    m15["time"]=pd.to_datetime(m15.time,unit="s",utc=True) if not pd.api.types.is_datetime64_any_dtype(m15.time) else m15.time
+    m15["asset_class"]=str(records[0].get("asset_class",""))
+    try:
+        candidates=live_candidates(symbol,m15,list(strategy_names),ROOT/"data"/"research_2020_2025"/"models")
+    except Exception:
+        LOG.exception("Approved strategy evaluation failed for %s",symbol)
+        candidates=[]
+    decision=None
+    for candidate in candidates:
+        side=candidate["side"]
+        context={"symbol":symbol,"strategy":candidate["strategy"],"setup":candidate["setup"],"quant_metrics":candidate["quant"],"asset_class":m15["asset_class"].iloc[-1],"last_completed_bar_utc":str(m15.time.iloc[-1])}
+        try:
+            proposed=groq_decision(context)
+        except Exception as exc:
+            LOG.exception("Decision generation failed for %s / %s",symbol,candidate["strategy"])
+            proposed={"decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":"Decision unavailable: "+type(exc).__name__}
+        if not validate_decision(proposed,side):proposed["decision"]="WAIT"
+        proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
+        decision=proposed
+        if decision["decision"] in ("BUY","SELL"):break
+    if decision is None and candidates==[]:
+        decision=None
+    _analysis_cache[symbol]=(bar_time,signature,decision)
     if account_id:
-        with _connect() as c:c.execute("INSERT OR IGNORE INTO trade_logs(account_id,symbol,signal_id,decision,confidence,reason,signal_json) VALUES(?,?,?,?,?,?,?)",(account_id,symbol,decision["signal_id"],decision["decision"],decision["confidence"],decision["reason"],json.dumps(decision)))
+        if decision:
+            with _connect() as c:c.execute("INSERT OR IGNORE INTO trade_logs(account_id,symbol,signal_id,decision,confidence,reason,signal_json) VALUES(?,?,?,?,?,?,?)",(account_id,symbol,decision["signal_id"],decision["decision"],decision["confidence"],decision["reason"],json.dumps(decision)))
     return decision
 
 @app.get("/")
@@ -248,6 +272,17 @@ def pwa_icon():return FileResponse(ROOT/"icon.svg",media_type="image/svg+xml")
 
 @app.get("/api/health")
 def health():return {"status":"ok","groq_configured":bool(os.getenv("GROQ_API_KEY"))}
+
+@app.get("/api/strategies")
+def approved_strategies(auth:LicenseContext=Depends(require_dashboard_license)):
+    """Expose only OOS/Monte-Carlo-qualified strategies, never raw account data."""
+    try:doc=json.loads(APPROVED_PATH.read_text(encoding="utf-8"))
+    except (OSError,ValueError):doc={"approved":[]}
+    items=[]
+    for row in doc.get("approved",[]):
+        if row.get("strategy") not in RESEARCH_STRATEGIES.values():continue
+        items.append({"symbol":row.get("symbol"),"asset_class":row.get("asset_class"),"strategy":row.get("strategy"),"oos":row.get("oos",{}),"monte_carlo":row.get("monte_carlo",{})})
+    return {"approved":items,"generated_at":doc.get("generated_at")}
 
 @app.post("/api/activate")
 def activate(request:ActivationRequest):
