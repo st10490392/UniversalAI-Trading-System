@@ -138,6 +138,31 @@ def test_backtest_exit_prices_include_adverse_slippage_and_spread():
     assert sell==pytest.approx(100.0003)
 
 
+def test_backtest_fills_next_open_and_uses_exported_point_size(monkeypatch):
+    from types import SimpleNamespace
+    import backtest as bt
+    n=420;times=pd.date_range("2025-01-01T00:00:00Z",periods=n,freq="15min")
+    close=np.full(n,100.);op=close.copy();high=close+.2;low=close-.2
+    close[300]=99.5;op[301]=100.;high[301]=100.5;low[301]=100.
+    high[302]=104.;low[302]=100.
+    df=pd.DataFrame({"time":times,"open":op,"high":high,"low":low,"close":close,"point_size":.01,"spread_points":1.,"tick_size":.01,"tick_value":1.})
+    quant=SimpleNamespace(ready=pd.Series(np.ones(n,dtype=bool)),gate=pd.Series(np.ones(n,dtype=bool)),zscore=pd.Series(np.zeros(n)),atr14=pd.Series(np.ones(n)))
+    monkeypatch.setattr(bt,"quant_metrics_series",lambda _d:quant)
+    monkeypatch.setattr(bt,"market_bias_series",lambda _d:pd.Series(["BULLISH"]*len(_d)))
+    monkeypatch.setattr(bt,"_smc_side_at",lambda h,l,c,i,bias:"BUY" if i==300 else None)
+    out=bt.run_backtest(df,symbol="Volatility 75 Index",slippage_points=2,spread_points=20,point=.1,commission_per_lot=0,commission_points=0)
+    assert out["trade_count"]==1
+    trade=out["trades"][0]
+    assert trade["entry_time"]==times[301]
+    assert trade["entry"]==pytest.approx(100.03)
+    assert trade["outcome"]=="win"
+
+
+def test_causal_spreads_backtester_does_not_fill_zeros_from_future():
+    from backtest import _causal_spread_points
+    assert _causal_spread_points(np.array([0.,4.,0.,8.,0.]),20).tolist()==[20.,4.,4.,8.,6.]
+
+
 @pytest.mark.parametrize("symbol,asset",[
     ("EURUSD.a","forex"),("XAUUSD","forex"),("USTEC.cash","index"),
     ("Volatility 75 Index","synthetic"),("Range Break 200 Index","synthetic"),
@@ -219,3 +244,52 @@ def test_monte_carlo_uses_requested_risk_and_repeatable_seed():
     a=research_lab._monte_carlo(trades,iterations=100,risk_pct=.75,seed=4)
     b=research_lab._monte_carlo(trades,iterations=100,risk_pct=.75,seed=4)
     assert a==b and a["risk_pct"]==.75 and a["probability_of_ruin_pct"]==0
+
+
+def _dated_r_trades(values, *, same_day=False):
+    base=pd.Timestamp("2025-01-01T00:00:00Z")
+    return [{"time":(base+pd.Timedelta(days=(0 if same_day else i),minutes=(i if same_day else 0))).isoformat(),"r":float(r)} for i,r in enumerate(values)]
+
+
+def test_monte_carlo_separates_prop_limits_from_equity_zero():
+    daily=research_lab._monte_carlo(_dated_r_trades([-1]*7,same_day=True),iterations=20,risk_pct=.75,seed=11)
+    assert daily["probability_daily_limit_breach_pct"]==100
+    assert daily["probability_total_limit_breach_pct"]==0
+    assert daily["probability_either_limit_breach_pct"]==100
+    assert daily["probability_equity_zero_pct"]==0
+    assert daily["p95_max_drawdown_pct"]==pytest.approx(5.137,abs=.01)
+
+    total=research_lab._monte_carlo(_dated_r_trades([-1]*15),iterations=20,risk_pct=.75,seed=11)
+    assert total["probability_daily_limit_breach_pct"]==0
+    assert total["probability_total_limit_breach_pct"]==100
+    assert total["probability_either_limit_breach_pct"]==100
+    assert total["probability_equity_zero_pct"]==0
+    assert total["p95_max_drawdown_pct"]==pytest.approx(10.003,abs=.02)
+
+
+def test_monte_carlo_account_zero_is_not_the_prop_ruin_definition():
+    out=research_lab._monte_carlo(_dated_r_trades([-200]),iterations=1,risk_pct=.75,seed=3)
+    assert out["probability_daily_limit_breach_pct"]==100
+    assert out["probability_total_limit_breach_pct"]==100
+    assert out["probability_equity_zero_pct"]==100
+    assert out["probability_of_ruin_pct"]==100
+    positive=research_lab._monte_carlo(_dated_r_trades([1]),iterations=1,risk_pct=.75,seed=3)
+    assert positive["probability_of_ruin_pct"]==0 and positive["probability_equity_zero_pct"]==0
+
+
+def test_causal_spread_fallback_uses_past_only():
+    d=pd.DataFrame({"spread_points":[0,4,0,8,0]})
+    assert research_lab._causal_spreads(d,20).tolist()==[20,4,4,8,6]
+
+
+def test_research_short_timeout_exits_at_ask():
+    d=pd.DataFrame({"time":pd.date_range("2025-01-01",periods=3,freq="15min",tz="UTC"),"open":[100.,100.,100.],"high":[100.5,100.5,100.5],"low":[99.5,99.5,99.5],"close":[100.,100.,100.],"point_size":[1.,1.,1.],"spread_points":[5.,5.,5.],"tick_size":[0.,0.,0.],"tick_value":[0.,0.,0.]})
+    trade=research_lab._trade_one(d,0,-1,2.,np.nan,breakeven=False,commission_per_lot=0.,slippage_points=0.,commission_points=0.,end_idx=3,horizon=1)
+    assert trade["exit"]==105.
+    assert trade["r"]==pytest.approx(-2.5)
+
+
+def test_research_point_commission_fallback_is_round_turn_once():
+    d=pd.DataFrame({"time":pd.date_range("2025-01-01",periods=3,freq="15min",tz="UTC"),"open":[100.,100.,100.],"high":[100.5,100.5,100.5],"low":[99.5,99.5,99.5],"close":[100.,100.,100.],"point_size":[1.,1.,1.],"spread_points":[0.,0.,0.],"tick_size":[0.,0.,0.],"tick_value":[0.,0.,0.]})
+    trade=research_lab._trade_one(d,0,1,10.,np.nan,breakeven=False,commission_per_lot=0.,slippage_points=0.,commission_points=2.,end_idx=3,horizon=1)
+    assert trade["r"]==pytest.approx(-.2)
