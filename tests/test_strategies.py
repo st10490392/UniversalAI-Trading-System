@@ -76,3 +76,83 @@ def test_research_performance_registry_requires_adverse_cost_stress():
     assert registry[0]["approved"] is False
     assert "Missing or invalid metric: cost_stressed_pf" in registry[0]["failures"]
     assert registry[1]["approved"] is True
+
+def test_anchored_orb_uses_session_opening_bars_from_datetime_index():
+    frame = _orb_buy_frame()
+    frame.index = pd.date_range("2026-01-05", periods=len(frame), freq="15min", tz="UTC")
+    anchor = frame.index[-9]
+    # Put an intervening candle outside the ORB before the breakout triple.
+    extra = frame.iloc[[-4]].copy()
+    extra.loc[:, "high"] = 102.0
+    extended = pd.concat([frame.iloc[:-3], extra, frame.iloc[-3:]], ignore_index=True)
+    extended.index = pd.date_range(frame.index[0], periods=len(extended), freq="15min", tz="UTC")
+    assert session_orb_retest(extended)["command"] == "WAIT"
+    assert session_orb_retest(extended, session_start_utc=anchor)["command"] == "BUY"
+    assert session_orb_retest(extended, session_start_utc=anchor + pd.Timedelta(minutes=1))["command"] == "WAIT"
+
+
+@pytest.mark.parametrize("fault", ["reverse", "duplicate", "nat", "gap", "nonpositive"])
+def test_bad_bars_fail_closed(fault):
+    frame = _orb_buy_frame()
+    frame["time"] = pd.date_range("2026-01-05", periods=len(frame), freq="15min", tz="UTC")
+    if fault == "reverse":
+        frame = frame.iloc[::-1]
+    elif fault == "duplicate":
+        frame.loc[10, "time"] = frame.loc[9, "time"]
+    elif fault == "nat":
+        frame.loc[10, "time"] = pd.NaT
+    elif fault == "gap":
+        frame.loc[20:, "time"] += pd.Timedelta(days=30)
+    else:
+        frame.loc[5, "low"] = -1.0
+    signal = session_orb_retest(frame)
+    assert signal["command"] == "WAIT"
+    assert signal["sl"] == signal["tp"] == signal["confidence"] == 0.0
+
+
+@pytest.mark.parametrize("spread_points", [0, 20, 50])
+def test_orb_buy_and_sell_preserve_spread_adjusted_rr(spread_points):
+    frame = _orb_buy_frame()
+    spread = spread_points * .01
+    buy = session_orb_retest(frame, point_value=.01, spread_points=spread_points)
+    ask = 100.4 + spread
+    assert (buy["tp"] - ask) / (ask - buy["sl"]) == pytest.approx(1.5)
+    mirror = pd.DataFrame({"open": 200 - frame.open, "high": 200 - frame.low,
+                           "low": 200 - frame.high, "close": 200 - frame.close})
+    sell = session_orb_retest(mirror, point_value=.01, spread_points=spread_points)
+    bid = 99.6
+    assert (bid - (sell["tp"] - spread)) / (sell["sl"] - bid) == pytest.approx(1.5)
+
+
+@pytest.mark.parametrize("bad", [np.nan, np.inf, -1, True, np.bool_(True), 1j])
+def test_pair_filter_rejects_invalid_metrics_and_isolates_copies(bad):
+    from strategies import validate_signal
+
+    with pytest.raises(ValueError):
+        PairPerformanceFilter(min_pf=bad)
+    registry = PairPerformanceFilter()
+    row = registry.evaluate_metrics("EURUSD", "test", {"trades": 100, "pf": 2, "max_dd_pct": bad, "cost_stressed_pf": 2})
+    assert not row["approved"] and not row["live_approval"]
+    row["failures"].clear()
+    export = registry.get_registry_export()[0]
+    assert export["failures"]
+    export["approved"] = True
+    assert not registry.is_approved("EURUSD", "test")
+    assert validate_signal({"command": "BUY"})["command"] == "WAIT"
+
+
+def test_default_research_output_does_not_touch_live_approval(tmp_path, monkeypatch):
+    import json
+    import sys
+    import research_lab
+
+    live = tmp_path / "approved_strategies.json"
+    output = tmp_path / "reports"
+    monkeypatch.setattr(research_lab, "APPROVED_PATH", live)
+    monkeypatch.setattr(research_lab, "run", lambda args: ([], []))
+    monkeypatch.setattr(sys, "argv", ["research_lab.py", "--output-dir", str(output)])
+    assert research_lab.main() == 0
+    assert not live.exists()
+    assert json.loads((output / "approved_candidates.json").read_text())["approved"] == []
+    sys.argv.extend(["--approved-path", str(live)])
+    assert research_lab.main() == 0 and live.exists()

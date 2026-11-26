@@ -7,6 +7,7 @@ from __future__ import annotations
 import json, logging, math, os, random, re, secrets, sqlite3, threading, time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Literal
 import numpy as np
@@ -24,9 +25,11 @@ load_dotenv(ROOT/".env",override=False)
 DB_PATH=Path(os.getenv("UNIVERSALAI_DB",ROOT/"accounts.db"))
 SYMBOLS=[s.strip() for s in os.getenv("MT5_SYMBOLS","EURUSD,XAUUSD,Volatility 75 Index,Boom 1000 Index,Crash 1000 Index").split(",") if s.strip()]
 LLM_PROVIDERS=(
-    ("GROQ","https://api.groq.com/openai/v1","qwen/qwen3.8-27b"),
+    ("GROQ","https://api.groq.com/openai/v1","openai/gpt-oss-20b"),
     ("GEMINI","https://generativelanguage.googleapis.com/v1beta/openai/","gemini-3.1-flash-lite"),
 )
+_provider_cooldowns:dict[str,float]={}
+_cooldown_lock=threading.Lock()
 SIGNAL_SCHEMA={"decision":"BUY|SELL|WAIT","entry":"number","sl":"number","tp":"number","confidence":"number","reason":"string"}
 LEVEL_TOLERANCE=float(os.getenv("UNIVERSALAI_LEVEL_TOLERANCE","0.10"))
 _THINK_RE=re.compile(r"<think>.*?</think>",re.S|re.I)
@@ -231,20 +234,42 @@ def _parse_model_json(content:Any)->dict[str,Any]:
 def _wait_signal(reason:str)->dict[str,Any]:
     return {"command":"WAIT","decision":"WAIT","entry":0.,"sl":0.,"tp":0.,"confidence":0.,"reason":reason}
 
+def _retry_after_seconds(header:str)->float:
+    try:
+        try:
+            seconds=float(header)
+        except ValueError:
+            seconds=(parsedate_to_datetime(header)-datetime.now(timezone.utc)).total_seconds()
+    except (ValueError, TypeError, OverflowError):
+        return 30.
+    return min(300.,max(0.,seconds)) if math.isfinite(seconds) else 30.
+
+
 def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
     prompt="Return only a JSON object matching "+json.dumps(SIGNAL_SCHEMA)+". Do not change setup side; uncertain means WAIT. Context: "+json.dumps(context)
+    try:
+        token_budget=int(os.getenv("LLM_MAX_COMPLETION_TOKENS","1024"))
+        if token_budget<=0:raise ValueError
+    except ValueError:
+        return _wait_signal("LLM_MAX_COMPLETION_TOKENS must be a positive integer")
     failures=[]
     for provider,default_url,default_model in LLM_PROVIDERS:
         key=os.getenv(provider+"_API_KEY","").strip()
         if not key:
             failures.append(provider+"_API_KEY is not configured")
             continue
+        with _cooldown_lock:
+            cooling_down=_provider_cooldowns.get(provider,0.)>time.monotonic()
+        if cooling_down:
+            failures.append(f"{provider} is cooling down after HTTP 429")
+            continue
         model=os.getenv(provider+"_MODEL",default_model)
         base_url=os.getenv(provider+"_BASE_URL",default_url).rstrip("/")
         body={"model":model,"messages":[{"role":"user","content":prompt}],"temperature":.1,"response_format":{"type":"json_object"}}
         if provider=="GROQ":
-            body["max_completion_tokens"]=4096
+            body["max_completion_tokens"]=token_budget
             if "qwen" in model.lower():body["reasoning_format"]="hidden"
+            if model.startswith("openai/gpt-oss"):body["reasoning_effort"]="low"
         else:
             body["max_tokens"]=4096
         try:
@@ -252,6 +277,10 @@ def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
             response.raise_for_status()
         except requests.RequestException as exc:
             status=exc.response.status_code if exc.response is not None else None
+            if status==429:
+                delay=_retry_after_seconds(exc.response.headers.get("retry-after","30"))
+                with _cooldown_lock:
+                    _provider_cooldowns[provider]=max(_provider_cooldowns.get(provider,0.),time.monotonic()+delay)
             failures.append(f"{provider} HTTP {status}" if status is not None else f"{provider} {type(exc).__name__}")
             continue
         try:
@@ -335,8 +364,12 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
         side=candidate["side"]
         context={"symbol":symbol,"side":side,"strategy":candidate["strategy"],"setup":candidate["setup"],"quant_metrics":candidate["quant"],"asset_class":m15["asset_class"].iloc[-1],"last_completed_bar_utc":str(m15.time.iloc[-1])}
         proposed=evaluate_llm_signal(context)
-        if proposed["decision"]!="WAIT" and not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):
+        if proposed["decision"]=="WAIT":
+            proposed=_wait_signal(proposed.get("reason") or "Provider returned WAIT")
+        elif not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):
             proposed=_wait_signal("Signal failed approved setup validation")
+        else:
+            proposed["command"]=proposed["decision"]
         proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"bar_time":bar_time,"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
         decision=proposed
         if decision["decision"] in ("BUY","SELL"):break

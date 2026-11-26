@@ -208,7 +208,7 @@ def build_signals(data: pd.DataFrame, symbol: str, strategy: str) -> tuple[np.nd
     return side,stop,target,code
 
 
-def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0) -> dict[str, Any] | None:
+def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0, absolute_stop: bool=False) -> dict[str, Any] | None:
     if entry_delay_bars < 0:
         raise ValueError("entry_delay_bars cannot be negative")
     entry_i=i+1+entry_delay_bars
@@ -220,7 +220,9 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
     spread=max(float(d.spread_points.iloc[entry_i]),0.0)*point
     slip=max(slippage_points,0.0)*point
     base_open=float(d.open.iloc[entry_i]); entry=base_open+spread+slip if side>0 else base_open-slip
-    risk=stop_dist; stop=entry-risk if side>0 else entry+risk
+    stop=stop_dist if absolute_stop else entry-side*stop_dist
+    risk=side*(entry-stop) if absolute_stop else stop_dist
+    if risk<=0:return None
     if np.isfinite(target_price):
         target=float(target_price)
         if (side>0 and target<=entry) or (side<0 and target>=entry):
@@ -265,7 +267,7 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
     return {"time":d.time.iloc[entry_i].isoformat(),"r":float(r),"outcome":outcome,"entry":float(entry),"exit":float(out_price),"bars_held":int(j-entry_i+1),"entry_delay_bars":entry_delay_bars}
 
 
-def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray], *, start: str, end: str, commission_per_lot: float=7.0, slippage_points: float=2.0, commission_points: float=1.0, breakeven: bool=False, horizon: int=96, spread_multiplier: float=1.0, spread_fallback_points: float=20.0, entry_delay_bars: int=0, random_delay_max_bars: int=0, seed: int=42) -> list[dict[str,Any]]:
+def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray], *, start: str, end: str, commission_per_lot: float=7.0, slippage_points: float=2.0, commission_points: float=1.0, breakeven: bool=False, horizon: int=96, spread_multiplier: float=1.0, spread_fallback_points: float=20.0, entry_delay_bars: int=0, random_delay_max_bars: int=0, seed: int=42, absolute_stops: bool=False) -> list[dict[str,Any]]:
     if spread_multiplier<0 or entry_delay_bars<0 or random_delay_max_bars<0:
         raise ValueError("spread multiplier and entry delays must be non-negative")
     spreads=_causal_spreads(data,spread_fallback_points)*spread_multiplier
@@ -280,14 +282,14 @@ def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray
     for i in valid:
         if i<next_free: continue
         delay=int(rng.integers(0,random_delay_max_bars+1)) if random_delay_max_bars else entry_delay_bars
-        trade=_trade_one(data,int(i),int(side[i]),float(stops[i]),float(targets[i]),breakeven=breakeven,commission_per_lot=commission_per_lot,slippage_points=slippage_points,commission_points=commission_points,end_idx=end_idx,horizon=horizon,entry_delay_bars=delay)
+        trade=_trade_one(data,int(i),int(side[i]),float(stops[i]),float(targets[i]),breakeven=breakeven,commission_per_lot=commission_per_lot,slippage_points=slippage_points,commission_points=commission_points,end_idx=end_idx,horizon=horizon,entry_delay_bars=delay,absolute_stop=absolute_stops)
         if trade:
             trade["signal_time"]=times.iloc[i].isoformat(); trades.append(trade)
             next_free=min(end_idx,int(i)+int(trade["entry_delay_bars"])+int(trade["bars_held"])+1)
     return trades
 
 
-def _stats(trades: list[dict[str,Any]], risk_pct: float=.75) -> dict[str,Any]:
+def _stats(trades: list[dict[str,Any]], risk_pct: float=.75, *, durations: list[int]|None=None) -> dict[str,Any]:
     eq=peak=1.0; maxdd=0.0; day_start=1.0; day_key=None; stopped_days=set(); stopped=False; month_ends={}; executed=[]
     for t in trades:
         r=float(t["r"])
@@ -295,6 +297,7 @@ def _stats(trades: list[dict[str,Any]], risk_pct: float=.75) -> dict[str,Any]:
         if day!=day_key: day_key=day; day_start=eq
         if stopped or day in stopped_days: continue
         executed.append(r)
+        if durations is not None:durations.append(t["bars_held"])
         eq*=max(0.0,1.0+r*risk_pct/100.0); peak=max(peak,eq); dd=(peak-eq)/peak*100; maxdd=max(maxdd,dd)
         if (day_start-eq)/max(day_start,1e-12)*100>=DAILY_DD_LIMIT_PCT: stopped_days.add(day)
         if dd>=TOTAL_DD_LIMIT_PCT: stopped=True
@@ -553,7 +556,7 @@ def main() -> int:
     parser.add_argument("--data-dir",type=Path,default=DATA_DEFAULT)
     parser.add_argument("--symbols",nargs="*",help="optional exact symbols for a small validation run")
     parser.add_argument("--output-dir",type=Path,default=OUT_DEFAULT)
-    parser.add_argument("--approved-path",type=Path,default=APPROVED_PATH)
+    parser.add_argument("--approved-path",type=Path,default=None,help="explicit approval output path; defaults to <output-dir>/approved_candidates.json")
     parser.add_argument("--commission-per-lot",type=float,default=7.0,help="round-turn account-currency commission per standard lot")
     parser.add_argument("--commission-points",type=float,default=1.0,help="fallback total round-turn commission in symbol points if MT5 tick value is unavailable")
     parser.add_argument("--spread-fallback-points",type=float,default=20.0,help="initial causal fallback spread before any positive historical spread is observed")
@@ -601,7 +604,8 @@ def main() -> int:
     qualified=[r for r in results if r.get("monte_carlo") is not None]
     approved=[r for r in approved if r["monte_carlo"]["probability_either_limit_breach_pct"]<=args.max_ruin_pct and r["monte_carlo"]["p95_max_drawdown_pct"]<=args.max_p95_drawdown_pct]
     payload={"generated_at":datetime.now(timezone.utc).isoformat(),"period":{"in_sample":"2020-01-01/2023-12-31","out_of_sample":"2024-01-01/2025-12-31"},"walk_forward":{"test_windows":[[x[0],x[1],x[2]] for x in WF_WINDOWS],"d_role":"2024 validation reporting only; 2025 final test; fixed threshold, no retuning"},"approval_criteria":{"oos_profit_factor_min":args.mc_min_pf,"oos_trade_count_min":args.mc_min_trades,"monte_carlo_iterations":args.mc_iterations,"risk_per_trade_pct":args.mc_risk_pct,"prop_daily_drawdown_pct":DAILY_DD_LIMIT_PCT,"prop_total_drawdown_pct":TOTAL_DD_LIMIT_PCT,"max_either_limit_breach_probability_pct":args.max_ruin_pct,"max_p95_drawdown_pct":args.max_p95_drawdown_pct},"monte_carlo_qualified":qualified,"approved":approved}
-    args.approved_path.parent.mkdir(parents=True,exist_ok=True);args.approved_path.write_text(json.dumps(payload,indent=2,allow_nan=False),encoding="utf-8")
+    target=args.approved_path or (args.output_dir/"approved_candidates.json")
+    target.parent.mkdir(parents=True,exist_ok=True);target.write_text(json.dumps(payload,indent=2,allow_nan=False),encoding="utf-8")
     profitable=[r for r in results if r["oos"]["total_return_pct"]>0]
     profitable.sort(key=lambda r:(r["oos"]["total_return_pct"],r["oos"]["profit_factor"] or 0),reverse=True)
     print("\nRanked OOS leaderboard (2024-2025; profitable combinations, max 15)")
@@ -613,7 +617,7 @@ def main() -> int:
         ruin=f"{mc['probability_either_limit_breach_pct']:.2f}" if "probability_either_limit_breach_pct" in mc else "--"
         print(f"{n:>2} {r['symbol']:<28.28} {r['strategy']:<42.42} {o['trades']:>7} {o['win_rate_pct']:>6.2f} {pf:>7} {o['max_drawdown_pct']:>8.2f} {o['total_return_pct']:>9.2f} {p95:>9} {ruin:>8}")
     print(f"\nSymbols={len({r['symbol'] for r in results})}; strategy-runs={len(results)}; Monte-Carlo candidates={len(qualified)}; approved after <= {args.max_ruin_pct:g}% ruin and <= {args.max_p95_drawdown_pct:g}% p95 DD={len(approved)}")
-    print(f"Reports: {args.output_dir}; approved file: {args.approved_path}")
+    print(f"Reports: {args.output_dir}; approval output: {target}")
     if not profitable: print("No profitable OOS combinations were observed in the available history.")
     return 0
 

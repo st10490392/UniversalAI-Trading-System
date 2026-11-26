@@ -6,7 +6,7 @@ Independent MT5 signal service, account controls, historical research tools, mob
 
 | File | Responsibility | Interface |
 | --- | --- | --- |
-| `brain.py` | MT5 M15/H1 data, quantitative/SMC gates, Groq Qwen decisions, accounts and license API | Pure engine functions and FastAPI JSON routes |
+| `brain.py` | MT5 M15/H1 data, quantitative/SMC gates, Groq and Gemini decisions, accounts and license API | Pure engine functions and FastAPI JSON routes |
 | `backtest.py` | Historical M15 simulation with rolling indicators, structure, costs, and drawdown | `run_backtest(DataFrame, ...)` or CLI |
 | `UniversalAI_EA.mq5` | License-bearing polling, local drawdown breaker, sizing, deduplication, execution | GET `/api/ea/poll/{account_id}/{symbol}` plus `X-License-Key` |
 | `index.html` | Mobile PWA activation, account view/settings, license admin panel | License/device headers and admin PIN routes |
@@ -33,9 +33,9 @@ Copy-Item .env.example .env
 notepad .env
 ```
 
-Set `ADMIN_PIN`, optionally `GROQ_API_KEY`, and select a Groq-supported `GROQ_MODEL` (default `qwen/qwen3-32b`). Set `MT5_SYMBOLS` to exact Market Watch names. Do not commit `.env`.
+Set `ADMIN_PIN`, optionally `GROQ_API_KEY` and `GEMINI_API_KEY`, and select a Groq-supported `GROQ_MODEL` (default `openai/gpt-oss-20b`). Set `MT5_SYMBOLS` to exact Market Watch names. Do not commit `.env`.
 
-Start the server with `python brain.py`; it binds `127.0.0.1:8000` by default. Open `http://127.0.0.1:8000/`, activate a license with the MT5 login, save account risk settings, then press START. Use the Admin button and `ADMIN_PIN` to issue keys. Without `GROQ_API_KEY`, qualified setups fail closed as WAIT.
+Start the server with `python brain.py`; it binds `127.0.0.1:8000` by default. Open `http://127.0.0.1:8000/`, activate a license with the MT5 login, save account risk settings, then press START. Use the Admin button and `ADMIN_PIN` to issue keys. Without a configured provider, qualified setups fail closed as WAIT.
 
 In MT5, open **Tools → Options → Expert Advisors**, enable **Allow WebRequest for listed URL**, and add `http://127.0.0.1:8000`. Compile `UniversalAI_EA.mq5` in MetaEditor. Attach the EA to charts, set the license key input, check the account login, and enable Algo Trading only on an account you intend to use. For remote mobile access, keep the service behind TLS and a private firewall/reverse proxy; the default server bind is loopback.
 
@@ -97,7 +97,7 @@ python research_lab.py
 
 The research runner evaluates four independent M15 families: (A) 12/26 EMA cross with RSI, ATR expansion and a +1.2R breakeven stop; (B) FX/index London and New York session Judas/FVG logic and session-free synthetic structural/breakout logic; (C) Bollinger/Keltner squeeze, 50-bar z-score and ER mean reversion; and (D) 20-bar volatility breakouts with an XGBoost classifier trained only on labelled 2020–2023 candidates and applied to 2024–2025 candidates. D's in-sample statistics show the raw breakout training-label pool, not fitted-model training accuracy. London/NY time windows use IANA time zones and handle daylight-saving transitions. Synthetic symbols never enter the session-filter path.
 
-Both in-sample (2020–2023) and out-of-sample (2024–2025) statistics are saved in ignored local files under `data/research_2020_2025/`. Every OOS pair with PF >= 1.25 and at least 80 trades receives a 1,000-order reshuffle Monte Carlo at 0.75% risk, with 5% daily and 10% peak-to-trough total drawdown stops. All such rows go in `monte_carlo_qualified`; the live `approved` list additionally requires ruin probability <= 5% and 95th-percentile drawdown <= 10% (both configurable CLI flags). The dashboard displays only this stricter list and `brain.py` fails closed for symbols/strategies absent from it. Qwen receives the current approved setup and indicator values as a final sanity check. For Strategy D live use, the matching XGBoost model JSON must also be present under `data/research_2020_2025/models/`.
+Both in-sample (2020–2023) and out-of-sample (2024–2025) statistics are saved in ignored local files under `data/research_2020_2025/`. Every OOS pair with PF >= 1.25 and at least 80 trades receives a 1,000-order reshuffle Monte Carlo at 0.75% risk, with 5% daily and 10% peak-to-trough total drawdown stops. All such rows go in `monte_carlo_qualified`; the live `approved` list additionally requires ruin probability <= 5% and 95th-percentile drawdown <= 10% (both configurable CLI flags). The dashboard displays only this stricter list and `brain.py` fails closed for symbols/strategies absent from it. The LLM receives the current approved setup and indicator values as a final sanity check. For Strategy D live use, the matching XGBoost model JSON must also be present under `data/research_2020_2025/models/`.
 
 ## Research validation audit
 
@@ -112,3 +112,8 @@ Costs use exported bar spreads, adverse slippage (2 points by default), and a de
 ## Verification
 
 Run `python -m pytest`. Tests use synthetic fixtures and temporary SQLite storage; they do not claim profitability, Groq connectivity, or live order placement. Test EA behavior on a demo terminal before considering any funded account. The server's EA poll route is not protected by an additional network token; license validation and loopback/private network deployment are required.
+
+
+By default, `research_lab.py` writes approval candidates to `<output-dir>/approved_candidates.json`. Use `--approved-path` to explicitly select a different destination.
+
+Run `python evaluate_deterministic.py` to evaluate the rolling ORB and EMA pullback strategies across both historical M15 CSV directories. It prints JSON lines per file, strategy, and cost scenario, including drawdown and trade durations in bars. Use `--pattern` and `--since` to limit the run.

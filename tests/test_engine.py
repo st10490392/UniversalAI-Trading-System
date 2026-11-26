@@ -310,6 +310,7 @@ def test_research_point_commission_fallback_is_round_turn_once():
     assert trade["r"]==pytest.approx(-.2)
 
 def test_llm_signal_provider_chain(monkeypatch):
+    monkeypatch.setattr(brain,"_provider_cooldowns",{})
     import json
     from unittest.mock import Mock
     import requests
@@ -350,6 +351,7 @@ def test_llm_signal_provider_chain(monkeypatch):
         ([response(json.dumps(dict(buy, sl=101)))], "SL/TP risk"),
         ([requests.Timeout(), response(json.dumps(dict(buy, tp=101)))], "SL/TP risk"),
     ):
+        brain._provider_cooldowns.clear()
         post = Mock(side_effect=replies)
         monkeypatch.setattr(brain.requests, "post", post)
         result = brain.evaluate_llm_signal({"side": "BUY"})
@@ -365,3 +367,38 @@ def test_llm_signal_provider_chain(monkeypatch):
     assert result["command"] == "WAIT"
     assert "GROQ_API_KEY" in result["reason"] and "GEMINI_API_KEY" in result["reason"]
     post.assert_not_called()
+
+def test_provider_cooldown_cap_and_valid_wait_veto(monkeypatch):
+    import json
+    from unittest.mock import Mock
+    import requests
+
+    for provider in ("GROQ", "GEMINI"):
+        monkeypatch.setenv(f"{provider}_API_KEY", "test-key")
+    monkeypatch.delenv("GROQ_MODEL", raising=False)
+    monkeypatch.delenv("LLM_MAX_COMPLETION_TOKENS", raising=False)
+    monkeypatch.setattr(brain, "_provider_cooldowns", {})
+    clock = Mock(return_value=100.0)
+    monkeypatch.setattr(brain.time, "monotonic", clock)
+    limited = requests.Response()
+    limited.status_code = 429
+    limited.headers["Retry-After"] = "900"
+    veto = Mock()
+    veto.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
+        "decision": "WAIT", "entry": 100, "sl": 97, "tp": 110, "confidence": .8, "reason": "Veto"
+    })}}]}
+    post = Mock(side_effect=[requests.HTTPError(response=limited), veto, veto, veto])
+    monkeypatch.setattr(brain.requests, "post", post)
+    expected = {"command": "WAIT", "decision": "WAIT", "entry": 0., "sl": 0., "tp": 0., "confidence": 0., "reason": "Veto"}
+    assert brain.evaluate_llm_signal({}) == expected
+    assert post.call_count == 2
+    groq_body = post.call_args_list[0].kwargs["json"]
+    assert groq_body["model"] == "openai/gpt-oss-20b"
+    assert groq_body["reasoning_effort"] == "low" and groq_body["max_completion_tokens"] == 1024
+    clock.return_value = 399.0
+    assert brain.evaluate_llm_signal({}) == expected
+    assert "googleapis.com" in post.call_args.args[0]
+    clock.return_value = 400.0
+    assert brain.evaluate_llm_signal({}) == expected
+    assert "groq.com" in post.call_args.args[0]
+    assert post.call_count == 4
