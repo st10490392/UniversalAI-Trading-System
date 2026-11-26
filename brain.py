@@ -19,6 +19,7 @@ from fastapi import Request
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from research_lab import STRATEGIES as RESEARCH_STRATEGIES, live_candidates
+from strategies import SIGNAL_SCHEMA, _make_wait, validate_signal
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
@@ -30,7 +31,6 @@ LLM_PROVIDERS=(
 )
 _provider_cooldowns:dict[str,float]={}
 _cooldown_lock=threading.Lock()
-SIGNAL_SCHEMA={"decision":"BUY|SELL|WAIT","entry":"number","sl":"number","tp":"number","confidence":"number","reason":"string"}
 LEVEL_TOLERANCE=float(os.getenv("UNIVERSALAI_LEVEL_TOLERANCE","0.10"))
 _THINK_RE=re.compile(r"<think>.*?</think>",re.S|re.I)
 LOG=logging.getLogger("universalai")
@@ -245,13 +245,38 @@ def _retry_after_seconds(header:str)->float:
     return min(300.,max(0.,seconds)) if math.isfinite(seconds) else 30.
 
 
+def _signal_messages(context:dict[str,Any])->list[dict[str,str]]:
+    properties={key:{"type":"number" if kind is float else "string"} for key,kind in SIGNAL_SCHEMA.items()}
+    properties["command"]["enum"]=["BUY","SELL","WAIT"]
+    schema={"type":"object","properties":properties,"required":list(SIGNAL_SCHEMA),"additionalProperties":False}
+    instructions=(
+        "You are a signal validator for a supplied deterministic setup. Output exactly one JSON object "
+        "matching this schema: "+json.dumps(schema)+". "
+        "Use finite JSON numbers for sl, tp and confidence. setup and reason must be nonempty strings. "
+        "Use the supplied strategy as the setup label when present. "
+        "For BUY or SELL, keep the supplied side and copy setup.stop to sl and setup.target to tp. "
+        "The entry reference is supplied in setup.entry_reference and is never an output key. "
+        "All three prices must be positive. BUY requires sl < entry reference < tp. "
+        "SELL requires tp < entry reference < sl. Reward divided by risk must be at least 2.5, "
+        "and actionable confidence must be between 0.75 and 1 inclusive. "
+        "If the setup is incomplete, invalid or uncertain, return WAIT with sl, tp and confidence all 0.0 "
+        "and explain why in reason. Do not include any other keys or text."
+    )
+    return [{"role":"system","content":instructions},{"role":"user","content":json.dumps(context)}]
+
+
 def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
-    prompt="Return only a JSON object matching "+json.dumps(SIGNAL_SCHEMA)+". Do not change setup side; uncertain means WAIT. Context: "+json.dumps(context)
+    """Return the exact strategy signal schema. EA compatibility is handled by the caller."""
+    setup_label=str(context.get("strategy") or "signal_evaluation")
+    def wait(reason:str)->dict[str,Any]:
+        return _make_wait(reason,setup_label)
+
+    messages=_signal_messages(context)
     try:
         token_budget=int(os.getenv("LLM_MAX_COMPLETION_TOKENS","1024"))
         if token_budget<=0:raise ValueError
     except ValueError:
-        return _wait_signal("LLM_MAX_COMPLETION_TOKENS must be a positive integer")
+        return wait("LLM_MAX_COMPLETION_TOKENS must be a positive integer")
     failures=[]
     for provider,default_url,default_model in LLM_PROVIDERS:
         key=os.getenv(provider+"_API_KEY","").strip()
@@ -265,7 +290,7 @@ def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
             continue
         model=os.getenv(provider+"_MODEL",default_model)
         base_url=os.getenv(provider+"_BASE_URL",default_url).rstrip("/")
-        body={"model":model,"messages":[{"role":"user","content":prompt}],"temperature":.1,"response_format":{"type":"json_object"}}
+        body={"model":model,"messages":messages,"temperature":.1,"response_format":{"type":"json_object"}}
         if provider=="GROQ":
             body["max_completion_tokens"]=token_budget
             if "qwen" in model.lower():body["reasoning_format"]="hidden"
@@ -285,32 +310,46 @@ def evaluate_llm_signal(context:dict[str,Any])->dict[str,Any]:
             continue
         try:
             choice=response.json()["choices"][0]
-            if choice["finish_reason"]!="stop":return _wait_signal(f"{provider} returned incomplete output")
+            if choice["finish_reason"]!="stop":return wait(f"{provider} returned incomplete output")
             result=_parse_model_json(choice["message"]["content"])
-            if result.keys()!=SIGNAL_SCHEMA.keys() or result["decision"] not in ("BUY","SELL","WAIT"):
-                raise ValueError("invalid signal schema")
-            if not isinstance(result["reason"],str) or not result["reason"].strip():
-                raise ValueError("invalid reason")
-            for field in ("entry","sl","tp","confidence"):
-                result[field]=_finite(result[field])
+            for field,kind in SIGNAL_SCHEMA.items():
+                if kind is float:result[field]=_finite(result[field])
+            if validate_signal(result)!=result:raise ValueError("invalid signal schema")
         except (ValueError,TypeError,IndexError,KeyError,OverflowError):
-            return _wait_signal(f"{provider} returned invalid signal JSON or schema")
-        decision=result["decision"]
-        result["reason"]=result["reason"][:1000]
-        if decision=="WAIT":return _wait_signal(result["reason"])
-        if not validate_decision(result,context.get("side",decision)):
-            return _wait_signal(f"{provider} signal failed side, confidence, or SL/TP risk validation")
-        if "setup" in context and not levels_match_setup(result,context["setup"]):
-            return _wait_signal(f"{provider} signal levels differ from the approved setup")
-        return {"command":decision,**result}
-    return _wait_signal("; ".join(failures))
+            return wait(f"{provider} returned invalid signal JSON, schema, or SL/TP geometry")
+        result["reason"]=result["reason"][:1000].rstrip() or "Provider signal"
+        if result["command"]=="WAIT":return result
+        try:
+            setup=context["setup"]
+            entry=_finite(setup["entry_reference"])
+        except (KeyError,TypeError,ValueError,OverflowError):
+            return wait("Missing or invalid setup entry reference")
+        if not _valid_signal_risk(result,entry,context.get("side")):
+            return wait(f"{provider} signal failed side, confidence, or SL/TP risk validation")
+        if not levels_match_setup({**result,"entry":entry},setup):
+            return wait(f"{provider} signal levels differ from the approved setup")
+        return result
+    return wait("; ".join(failures))
+
+
+def _valid_signal_risk(signal:dict[str,Any],entry:float,side:str|None)->bool:
+    sl,tp,confidence=(signal[k] for k in ("sl","tp","confidence"))
+    if signal["command"]!=side or not all(math.isfinite(v) for v in (entry,sl,tp,confidence)):
+        return False
+    if min(entry,sl,tp)<=0 or not .75<=confidence<=1:return False
+    directional=(side=="BUY" and sl<entry<tp) or (side=="SELL" and tp<entry<sl)
+    if not directional:return False
+    reward_risk=abs(tp-entry)/abs(entry-sl)
+    return math.isfinite(reward_risk) and reward_risk>=2.5
+
 
 def validate_decision(result:dict[str,Any],side:str)->bool:
-    try:c,e,sl,tp=(float(result[k]) for k in ("confidence","entry","sl","tp"))
-    except (KeyError,TypeError,ValueError):return False
-    if result.get("decision")!=side or not all(math.isfinite(v) for v in (c,e,sl,tp)) or min(e,sl,tp)<=0 or not .75<=c<=1:return False
-    directional=(side=="BUY" and sl<e<tp) or (side=="SELL" and tp<e<sl)
-    return bool(directional and abs(e-sl)>0 and abs(tp-e)/abs(e-sl)>=2.5)
+    try:
+        entry=float(result["entry"])
+        signal={key:float(result[key]) for key in ("sl","tp","confidence")}
+    except (KeyError,TypeError,ValueError,OverflowError):
+        return False
+    return _valid_signal_risk({**signal,"command":result.get("decision")},entry,side)
 
 def levels_match_setup(result:dict[str,Any],setup:Any)->bool:
     """The model may veto a setup, not re-price it: entry/SL/TP must sit within LEVEL_TOLERANCE x risk of the deterministic setup."""
@@ -363,13 +402,11 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
     for candidate in candidates:
         side=candidate["side"]
         context={"symbol":symbol,"side":side,"strategy":candidate["strategy"],"setup":candidate["setup"],"quant_metrics":candidate["quant"],"asset_class":m15["asset_class"].iloc[-1],"last_completed_bar_utc":str(m15.time.iloc[-1])}
-        proposed=evaluate_llm_signal(context)
-        if proposed["decision"]=="WAIT":
-            proposed=_wait_signal(proposed.get("reason") or "Provider returned WAIT")
-        elif not (validate_decision(proposed,side) and levels_match_setup(proposed,candidate["setup"])):
-            proposed=_wait_signal("Signal failed approved setup validation")
+        signal=evaluate_llm_signal(context)
+        if signal["command"]=="WAIT":
+            proposed=_wait_signal(signal["reason"])
         else:
-            proposed["command"]=proposed["decision"]
+            proposed={**signal,"decision":signal["command"],"entry":float(candidate["setup"]["entry_reference"])}
         proposed.update({"symbol":symbol,"strategy":candidate["strategy"],"breakeven_at_r":1.2 if candidate["strategy"]==RESEARCH_STRATEGIES["A"] else 0.0,"bias":side,"quant":candidate["quant"],"setup":candidate["setup"],"bar_time":bar_time,"signal_id":f"{symbol}-{bar_time}-{candidate['strategy'].replace(' ','_')}","reason":proposed.get("reason","")})
         decision=proposed
         if decision["decision"] in ("BUY","SELL"):break

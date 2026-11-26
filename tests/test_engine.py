@@ -219,15 +219,17 @@ def test_approved_live_candidate_passes_exact_setup_and_quant_to_qwen(monkeypatc
 
     monkeypatch.setattr(brain,"_analysis_cache",{})
     monkeypatch.setenv("GROQ_API_KEY","test-key")
-    result={"decision":"BUY","entry":1.2,"sl":1.19,"tp":1.225,"confidence":.9,"reason":"sanity check passed"}
+    result={"command":"BUY","sl":1.19,"tp":1.225,"confidence":.9,"setup":"Trend Momentum","reason":"sanity check passed"}
     reply=Mock()
     reply.json.side_effect=lambda: {"choices":[{"finish_reason":"stop","message":{"content":json.dumps(result)}}]}
     post=Mock(return_value=reply)
     monkeypatch.setattr(brain.requests,"post",post)
     out=brain.analyze_symbol("EURUSD")
     assert out["decision"]=="BUY" and out["strategy"]=="Trend Momentum" and out["breakeven_at_r"]==1.2
-    prompt=post.call_args.kwargs["json"]["messages"][0]["content"]
-    context=json.loads(prompt.split("Context: ",1)[1])
+    messages=post.call_args.kwargs["json"]["messages"]
+    assert [message["role"] for message in messages]==["system","user"]
+    context=json.loads(messages[1]["content"])
+    assert out["entry"]==setup["entry_reference"] and out["command"]=="BUY"
     assert context["setup"]==setup and context["quant_metrics"]==quant
 
     brain._analysis_cache.clear()
@@ -325,12 +327,17 @@ def test_llm_signal_provider_chain(monkeypatch):
         reply.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": content}}]}
         return reply
 
-    buy = {"decision": "BUY", "entry": 100, "sl": 96, "tp": 110, "confidence": .9, "reason": "Approved"}
-    sell = dict(buy, decision="SELL", sl=104, tp=90)
+    buy = {"command": "BUY", "sl": 96.0, "tp": 110.0, "confidence": .9, "setup": "Test", "reason": "Approved"}
+    sell = dict(buy, command="SELL", sl=104.0, tp=90.0)
+    def context_for(signal):
+        return {"side": signal["command"], "strategy": "Test",
+                "setup": {"entry_reference": 100., "stop": signal["sl"], "target": signal["tp"]}}
+    buy_context = context_for(buy)
     for valid in (buy, sell):
         post = Mock(return_value=response("<think>analysis</think>\n```json\n" + json.dumps(valid) + "\n```"))
         monkeypatch.setattr(brain.requests, "post", post)
-        assert brain.evaluate_llm_signal({"side": valid["decision"]}) == dict(valid, command=valid["decision"])
+        result = brain.evaluate_llm_signal(context_for(valid))
+        assert result == valid == brain.validate_signal(result)
         post.assert_called_once()
 
     rate_limit = requests.Response()
@@ -338,24 +345,31 @@ def test_llm_signal_provider_chain(monkeypatch):
     for error in (requests.ConnectionError(), requests.Timeout(), requests.HTTPError(response=rate_limit)):
         post = Mock(side_effect=[error, response(json.dumps(buy))])
         monkeypatch.setattr(brain.requests, "post", post)
-        assert brain.evaluate_llm_signal({"side": "BUY"}) == dict(buy, command="BUY")
+        assert brain.evaluate_llm_signal(buy_context) == buy
         assert [call.args[0] for call in post.call_args_list] == [
             "https://groq.example/v1/chat/completions", "https://gemini.example/v1/chat/completions"
         ]
-        assert post.call_args.kwargs["json"]["model"] == "test-model-GEMINI"
+        assert post.call_args.kwargs["json"] == {
+            "model": "test-model-GEMINI", "messages": brain._signal_messages(buy_context),
+            "temperature": .1, "response_format": {"type": "json_object"}, "max_tokens": 4096,
+        }
 
     for replies, reason in (
         ([requests.Timeout(), requests.HTTPError(response=rate_limit)], "GEMINI HTTP 429"),
         ([requests.Timeout(), response("invalid JSON")], "GEMINI returned invalid"),
         ([response(json.dumps(dict(buy, extra=True)))], "GROQ returned invalid"),
         ([response(json.dumps(dict(buy, sl=101)))], "SL/TP risk"),
+        ([response(json.dumps(dict(buy, tp=95)))], "geometry"),
+        ([response(json.dumps(dict(buy, command="WAIT")))], "invalid"),
+        ([response(json.dumps(dict(buy, sl="96")))], "invalid"),
+        ([response(json.dumps(dict(buy, tp=111)))], "differ from the approved setup"),
         ([requests.Timeout(), response(json.dumps(dict(buy, tp=101)))], "SL/TP risk"),
     ):
         brain._provider_cooldowns.clear()
         post = Mock(side_effect=replies)
         monkeypatch.setattr(brain.requests, "post", post)
-        result = brain.evaluate_llm_signal({"side": "BUY"})
-        assert result["command"] == result["decision"] == "WAIT"
+        result = brain.evaluate_llm_signal(buy_context)
+        assert result["command"] == "WAIT" and brain.validate_signal(result) == result
         assert result["sl"] == result["tp"] == result["confidence"] == 0.0
         assert reason in result["reason"]
         assert post.call_count == len(replies)
@@ -363,7 +377,7 @@ def test_llm_signal_provider_chain(monkeypatch):
     monkeypatch.delenv("GROQ_API_KEY")
     monkeypatch.delenv("GEMINI_API_KEY")
     post.reset_mock()
-    result = brain.evaluate_llm_signal({"side": "BUY"})
+    result = brain.evaluate_llm_signal(buy_context)
     assert result["command"] == "WAIT"
     assert "GROQ_API_KEY" in result["reason"] and "GEMINI_API_KEY" in result["reason"]
     post.assert_not_called()
@@ -385,11 +399,11 @@ def test_provider_cooldown_cap_and_valid_wait_veto(monkeypatch):
     limited.headers["Retry-After"] = "900"
     veto = Mock()
     veto.json.return_value = {"choices": [{"finish_reason": "stop", "message": {"content": json.dumps({
-        "decision": "WAIT", "entry": 100, "sl": 97, "tp": 110, "confidence": .8, "reason": "Veto"
+        "command": "WAIT", "sl": 0., "tp": 0., "confidence": 0., "setup": "Test", "reason": "Veto"
     })}}]}
     post = Mock(side_effect=[requests.HTTPError(response=limited), veto, veto, veto])
     monkeypatch.setattr(brain.requests, "post", post)
-    expected = {"command": "WAIT", "decision": "WAIT", "entry": 0., "sl": 0., "tp": 0., "confidence": 0., "reason": "Veto"}
+    expected = {"command": "WAIT", "sl": 0., "tp": 0., "confidence": 0., "setup": "Test", "reason": "Veto"}
     assert brain.evaluate_llm_signal({}) == expected
     assert post.call_count == 2
     groq_body = post.call_args_list[0].kwargs["json"]
