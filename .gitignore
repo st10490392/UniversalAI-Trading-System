@@ -9,8 +9,7 @@ accounts.db-wal
 *.ex5
 *.log
 trades.csv
-data/historical_12m/
-data/history_2020_2025/
+data/historical_12m/backtest_summary.csv
 data/research_2020_2025/
 data/research_audit_2026_11/
 approved_strategies.json
