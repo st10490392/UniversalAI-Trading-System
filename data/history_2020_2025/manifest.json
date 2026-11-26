@@ -1,0 +1,642 @@
+{
+  "period_start_utc": "2020-01-01T00:00:00+00:00",
+  "period_end_exclusive_utc": "2026-01-01T00:00:00+00:00",
+  "timeframe": "M15",
+  "account_mode": "demo",
+  "symbols": [
+    {
+      "symbol": "AUDUSD",
+      "asset_class": "forex",
+      "family": "forex",
+      "bars": 77526,
+      "earliest_utc": "2022-11-18T04:45:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "AUDUSD_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 1000 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69337,
+      "earliest_utc": "2024-01-09T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_1000_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 150 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 9939,
+      "earliest_utc": "2025-09-19T11:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_150_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 300 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68414,
+      "earliest_utc": "2024-01-19T08:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_300_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 50 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 717,
+      "earliest_utc": "2025-12-24T12:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_50_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 500 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69023,
+      "earliest_utc": "2024-01-13T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_500_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 600 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46900,
+      "earliest_utc": "2024-08-30T10:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_600_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Boom 900 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46900,
+      "earliest_utc": "2024-08-30T10:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Boom_900_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 1000 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68735,
+      "earliest_utc": "2024-01-16T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_1000_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 150 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 9939,
+      "earliest_utc": "2025-09-19T11:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_150_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 300 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68414,
+      "earliest_utc": "2024-01-19T08:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_300_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 50 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 717,
+      "earliest_utc": "2025-12-24T12:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_50_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 500 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69215,
+      "earliest_utc": "2024-01-11T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_500_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 600 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46900,
+      "earliest_utc": "2024-08-30T10:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_600_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Crash 900 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46900,
+      "earliest_utc": "2024-08-30T10:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Crash_900_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "EURUSD",
+      "asset_class": "forex",
+      "family": "forex",
+      "bars": 77528,
+      "earliest_utc": "2022-11-18T04:15:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "EURUSD_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "GBPUSD",
+      "asset_class": "forex",
+      "family": "forex",
+      "bars": 77525,
+      "earliest_utc": "2022-11-18T05:00:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "GBPUSD_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Germany 40",
+      "asset_class": "index",
+      "family": "GER40",
+      "bars": 45209,
+      "earliest_utc": "2024-01-22T10:30:00+00:00",
+      "latest_utc": "2025-12-30T20:45:00+00:00",
+      "file": "Germany_40_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Jump 10 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68543,
+      "earliest_utc": "2024-01-18T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Jump_10_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Jump 100 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68414,
+      "earliest_utc": "2024-01-19T08:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Jump_100_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Jump 25 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68735,
+      "earliest_utc": "2024-01-16T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Jump_25_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Jump 50 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68927,
+      "earliest_utc": "2024-01-14T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Jump_50_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Jump 75 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68735,
+      "earliest_utc": "2024-01-16T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Jump_75_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Ladder Volatility Down Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 10609,
+      "earliest_utc": "2025-09-12T11:30:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Ladder_Volatility_Down_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Ladder Volatility Up Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 10608,
+      "earliest_utc": "2025-09-12T11:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Ladder_Volatility_Up_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Range Break 100 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69119,
+      "earliest_utc": "2024-01-12T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Range_Break_100_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Range Break 200 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69119,
+      "earliest_utc": "2024-01-12T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Range_Break_200_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Skew Step Index 4 Down",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46899,
+      "earliest_utc": "2024-08-30T11:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Skew_Step_Index_4_Down_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Skew Step Index 4 Up",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46899,
+      "earliest_utc": "2024-08-30T11:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Skew_Step_Index_4_Up_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Skew Step Index 5 Down",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46899,
+      "earliest_utc": "2024-08-30T11:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Skew_Step_Index_5_Down_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Skew Step Index 5 Up",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46899,
+      "earliest_utc": "2024-08-30T11:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Skew_Step_Index_5_Up_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Step Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68414,
+      "earliest_utc": "2024-01-19T08:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Step_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Step Index 200",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 61143,
+      "earliest_utc": "2024-04-04T02:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Step_Index_200_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Step Index 300",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 40277,
+      "earliest_utc": "2024-11-07T10:30:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Step_Index_300_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Step Index 400",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 40277,
+      "earliest_utc": "2024-11-07T10:30:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Step_Index_400_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Step Index 500",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 61143,
+      "earliest_utc": "2024-04-04T02:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Step_Index_500_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "US Tech 100",
+      "asset_class": "index",
+      "family": "US100",
+      "bars": 45835,
+      "earliest_utc": "2024-01-22T10:30:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "US_Tech_100_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "USDJPY",
+      "asset_class": "forex",
+      "family": "forex",
+      "bars": 77525,
+      "earliest_utc": "2022-11-18T04:30:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "USDJPY_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 10 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 69119,
+      "earliest_utc": "2024-01-12T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_10_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 10 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68543,
+      "earliest_utc": "2024-01-18T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_10_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 100 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68831,
+      "earliest_utc": "2024-01-15T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_100_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 100 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68414,
+      "earliest_utc": "2024-01-19T08:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_100_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 15 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 32108,
+      "earliest_utc": "2025-01-31T12:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_15_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 150 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68927,
+      "earliest_utc": "2024-01-14T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_150_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 25 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68735,
+      "earliest_utc": "2024-01-16T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_25_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 25 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68543,
+      "earliest_utc": "2024-01-18T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_25_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 250 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68639,
+      "earliest_utc": "2024-01-17T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_250_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 30 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 32108,
+      "earliest_utc": "2025-01-31T12:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_30_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 5 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 531,
+      "earliest_utc": "2025-12-26T11:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_5_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 5 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 531,
+      "earliest_utc": "2025-12-26T11:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_5_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 50 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68543,
+      "earliest_utc": "2024-01-18T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_50_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 50 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68543,
+      "earliest_utc": "2024-01-18T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_50_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 75 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68639,
+      "earliest_utc": "2024-01-17T00:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_75_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 75 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 68413,
+      "earliest_utc": "2024-01-19T08:30:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_75_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility 90 (1s) Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 32108,
+      "earliest_utc": "2025-01-31T12:45:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_90_1s_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Boom 400 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 47555,
+      "earliest_utc": "2024-08-23T15:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Boom_400_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Boom 550 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46218,
+      "earliest_utc": "2024-09-06T13:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Boom_550_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Boom 750 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 47555,
+      "earliest_utc": "2024-08-23T15:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Boom_750_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Crash 400 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 47555,
+      "earliest_utc": "2024-08-23T15:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Crash_400_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Crash 550 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 46218,
+      "earliest_utc": "2024-09-06T13:15:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Crash_550_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Volatility Crash 750 Index",
+      "asset_class": "synthetic",
+      "family": "synthetic",
+      "bars": 47555,
+      "earliest_utc": "2024-08-23T15:00:00+00:00",
+      "latest_utc": "2025-12-31T23:45:00+00:00",
+      "file": "Volatility_Crash_750_Index_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "Wall Street 30",
+      "asset_class": "index",
+      "family": "US30",
+      "bars": 45832,
+      "earliest_utc": "2024-01-22T10:30:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "Wall_Street_30_M15_2020_2025.csv"
+    },
+    {
+      "symbol": "XAUUSD",
+      "asset_class": "forex",
+      "family": "forex",
+      "bars": 78681,
+      "earliest_utc": "2022-08-30T20:30:00+00:00",
+      "latest_utc": "2025-12-31T21:45:00+00:00",
+      "file": "XAUUSD_M15_2020_2025.csv"
+    }
+  ],
+  "skipped_symbols": [
+    {
+      "symbol": "Boom 100 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Boom 200 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Boom 99 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash 100 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash 200 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash 99 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash Boom Flip 1000 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash Boom Flip 150 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash Boom Flip 300 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Crash Boom Flip 500 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Volatility 15 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Volatility 30 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    },
+    {
+      "symbol": "Volatility 90 Index",
+      "reason": "broker returned no M15 bars in requested interval"
+    }
+  ],
+  "market_watch_matches": 76,
+  "missing_requested_market_watch": [
+    {
+      "symbol": "GBPJPY",
+      "family": "forex",
+      "reason": "not visible in Market Watch"
+    },
+    {
+      "symbol": "USDCAD",
+      "family": "forex",
+      "reason": "not visible in Market Watch"
+    }
+  ]
+}
