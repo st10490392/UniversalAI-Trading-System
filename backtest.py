@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Any
 import numpy as np
 import pandas as pd
-from brain import detect_smc, in_kill_zone, is_synthetic, market_bias_series, quant_allows, quant_metrics_series
+from brain import in_kill_zone, is_synthetic, market_bias_series, quant_metrics_series
 
 def load_csv(path:str|Path)->pd.DataFrame:
     d=pd.read_csv(path)
@@ -43,11 +43,30 @@ def _walk_exit(future:pd.DataFrame,side:str,entry:float,sl:float,tp:float,traili
     close=float(last.close)-(slippage_price if side=="BUY" else -float(last.spread_price)-slippage_price)
     return close,"open_close",max(0,len(future)-1)
 
+def _smc_side_at(high:np.ndarray,low:np.ndarray,close:np.ndarray,i:int,bias:str)->str|None:
+    """Allocation-free equivalent of brain.detect_smc for the current bar."""
+    if i<24 or bias not in ("BULLISH","BEARISH"):return None
+    bullish_fvg=low[i]>high[i-2];bearish_fvg=high[i]<low[i-2]
+    if bias=="BULLISH" and not bullish_fvg:return None
+    if bias=="BEARISH" and not bearish_fvg:return None
+    for j in range(i-2,max(19,i-6),-1):
+        level=float(np.min(low[j-20:j]))
+        if bias=="BULLISH" and low[j]<level and close[j]>level:return "BUY"
+        if bias=="BEARISH" and high[j]>float(np.max(high[j-20:j])) and close[j]<float(np.max(high[j-20:j])):return "SELL"
+    return None
+
 def run_backtest(data:pd.DataFrame,symbol:str="EURUSD",risk_pct:float=1.0,max_daily_dd_pct:float=5.0,max_total_dd_pct:float=10.0,initial_balance:float=10000.0,trailing_atr_multiple:float=0.0,spread_points:float=20.0,slippage_points:float=2.0,point:float=0.00001)->dict[str,Any]:
     d=data.copy().reset_index(drop=True)
     if len(d)<400:raise ValueError("At least 400 M15 rows are required for warm-up and H1 structure")
     if risk_pct<=0 or max_daily_dd_pct<=0 or max_total_dd_pct<=0 or initial_balance<=0:raise ValueError("Risk and drawdown limits must be positive")
-    h1=_resample_h1(d);h1_bias=market_bias_series(h1);quant=quant_metrics_series(d)
+    h1=_resample_h1(d);h1_bias=market_bias_series(h1).to_numpy()
+    quant=quant_metrics_series(d)
+    highs=d.high.to_numpy(dtype=float);lows=d.low.to_numpy(dtype=float);closes=d.close.to_numpy(dtype=float)
+    q_ready=quant.ready.to_numpy(dtype=bool);q_gate=quant.gate.to_numpy(dtype=bool);q_z=quant.zscore.to_numpy(dtype=float);q_atr=quant.atr14.to_numpy(dtype=float)
+    signal_times=pd.to_datetime(d.time,utc=True)+pd.Timedelta(minutes=15)
+    signal_ns=signal_times.astype("int64").to_numpy();signal_days=signal_times.dt.date.to_numpy()
+    session_minutes=(signal_times.dt.hour*60+signal_times.dt.minute).to_numpy()
+    session_ok=((session_minutes>=420)&(session_minutes<600))|((session_minutes>=720)&(session_minutes<960))
     points=d["point"].astype(float).to_numpy() if "point" in d.columns else np.full(len(d),point)
     raw_spread=d["spread_points"].astype(float).to_numpy() if "spread_points" in d.columns else np.full(len(d),spread_points)
     raw_spread=np.where(raw_spread>0,raw_spread,spread_points)
@@ -57,23 +76,21 @@ def run_backtest(data:pd.DataFrame,symbol:str="EURUSD",risk_pct:float=1.0,max_da
     balance=initial_balance; peak=initial_balance; max_dd=0.; trades=[]; day_start={}; blocked_days=set(); i=250
     while i<len(d)-1:
         # The signal is generated after this M15 candle has closed.
-        ts=pd.Timestamp(d.time.iloc[i])+pd.Timedelta(minutes=15); day=ts.date()
+        ts=signal_times.iloc[i]; day=signal_days[i]
         if day not in day_start:day_start[day]=balance
         if day in blocked_days or (day_start[day]-balance)/day_start[day]*100>=max_daily_dd_pct or (peak-balance)/peak*100>=max_total_dd_pct:
             i+=1;continue
-        signal_time=ts.to_pydatetime()
-        if signal_time.tzinfo is None:signal_time=signal_time.replace(tzinfo=timezone.utc)
-        if not is_synthetic(symbol) and not in_kill_zone(signal_time):i+=1;continue
+        if not is_synthetic(symbol) and not session_ok[i]:i+=1;continue
         # H1 data is truncated at the signal timestamp to avoid lookahead.
-        hi=np.searchsorted(h1_ns,ts.value,side="right")-1
-        bias=str(h1_bias.iloc[hi]) if hi>=0 else "NEUTRAL"
-        setup=detect_smc(d.iloc[max(0,i-25):i+1],bias)
-        metrics=quant.iloc[i].to_dict()
-        if not setup or not quant_allows(metrics,setup["side"]):i+=1;continue
-        side=setup["side"];atr=float(metrics["atr14"]);slip=float(slippage_price[i]);spr=float(spread_price[i])
-        bid_close=float(d.close.iloc[i]);entry=bid_close+spr+slip if side=="BUY" else bid_close-slip
+        hi=np.searchsorted(h1_ns,signal_ns[i],side="right")-1
+        bias=str(h1_bias[hi]) if hi>=0 else "NEUTRAL"
+        if not q_ready[i] or not q_gate[i]:i+=1;continue
+        side=_smc_side_at(highs,lows,closes,i,bias)
+        if side is None or (side=="BUY" and q_z[i]>2.) or (side=="SELL" and q_z[i]< -2.):i+=1;continue
+        atr=float(q_atr[i]);slip=float(slippage_price[i]);spr=float(spread_price[i])
+        bid_close=float(closes[i]);entry=bid_close+spr+slip if side=="BUY" else bid_close-slip
         # Sweep wick supplies the structural stop; reject nonpositive or pathological risk.
-        sl=float(d.low.iloc[i]) if side=="BUY" else float(d.high.iloc[i])+spr
+        sl=float(lows[i]) if side=="BUY" else float(highs[i])+spr
         risk=abs(entry-sl)
         if risk<=0 or risk>atr*3:i+=1;continue
         tp=entry+2.5*risk if side=="BUY" else entry-2.5*risk

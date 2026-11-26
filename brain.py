@@ -175,7 +175,8 @@ def detect_smc(data_m15:Any,bias:str)->dict[str,Any]|None:
     return None
 
 def is_synthetic(symbol:str)->bool:
-    s=symbol.lower(); return any(x in s for x in ("volatility","boom","crash","step index","jump","synthetic"))
+    s=symbol.lower();compact="".join(ch for ch in s if ch.isalnum())
+    return any(x in s for x in ("volatility","boom","crash","step index","skew step","jump","synthetic")) or "rangebreak" in compact
 
 def in_kill_zone(now:datetime|None=None)->bool:
     """UTC London (07-10) and New York (12-16); broker DST calendars are not inferred."""
@@ -318,7 +319,7 @@ def logs(account_id:str,limit:int=Query(50,ge=1,le=200),auth:LicenseContext=Depe
     with _connect() as c:return [dict(r) for r in c.execute("SELECT * FROM trade_logs WHERE account_id=? ORDER BY id DESC LIMIT ?",(account_id,limit))]
 
 @app.get("/api/ea/poll/{account_id}/{symbol}")
-def ea_poll(account_id:str,symbol:str,balance:float=0,equity:float=0,x_license_key:str=Header(default="")):
+def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default="")):
     init_db()
     if not _valid_license(x_license_key,account_id):return {"command":"UNAUTHORIZED"}
     with _connect() as c:
@@ -345,4 +346,4 @@ if __name__=="__main__":
     import uvicorn
     init_db()
     if os.getenv("ENABLE_BACKGROUND_SCANNER","0")=="1":threading.Thread(target=scan_loop,daemon=True,name="market-scanner").start()
-    uvicorn.run(app,host=os.getenv("HOST","127.0.0.1"),port=int(os.getenv("PORT","8000")))
+    uvicorn.run(app,host=os.getenv("HOST","127.0.0.1"),port=int(os.getenv("PORT","8000")),access_log=False)

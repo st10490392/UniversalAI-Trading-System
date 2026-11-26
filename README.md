@@ -56,7 +56,7 @@ Set `GROQ_API_KEY=...` and restart the server. The repository includes `.env.exa
 - `POST /api/activate` body: `license_key`, `account_id`, `device_id`; binds the first account/device pair.
 - User account routes require `X-License-Key`, `X-License-Account-ID`, and `X-Device-ID`.
 - Admin routes `/api/admin/licenses/create`, `/api/admin/licenses`, `/api/admin/licenses/{key}/toggle`, and `/api/admin/licenses/{key}/reset-device` require `X-Admin-PIN`.
-- EA route `GET /api/ea/poll/{account_id}/{symbol}?balance=...&equity=...` requires `X-License-Key`; invalid license returns `command=UNAUTHORIZED`.
+- EA route `GET /api/ea/poll/{account_id}/{symbol}` requires `X-License-Key` and accepts balance/equity in headers to keep them out of access-log URLs; invalid license returns `command=UNAUTHORIZED`.
 - `/api/health`, dashboard shell, and activation are public. OpenAPI is at `/docs` on the local server.
 
 ## Quant/SMC decisions
@@ -69,14 +69,14 @@ Set `GROQ_API_KEY=...` and restart the server. The repository includes `.env.exa
 
 ## 12-month MT5 history and backtests
 
-The exporter requires the connected MT5 session to be a demo account. It skips symbols not visible in Market Watch and writes up to the previous 365 days of completed M15 data, including historical spread points and symbol point size:
+The exporter requires the connected MT5 session to be a demo account. It discovers every matching visible symbol in Market Watch for Volatility, Boom/Crash, Step, Jump, Range Break, seven major FX pairs, gold/silver, and Nasdaq/GER30/US30 aliases. Broker naming varies; missing expected names are reported and skipped. It writes up to the previous 365 days of completed M15 data, including historical spread points and symbol point size:
 
 ```powershell
 python tools/export_mt5_history.py
 python tools/run_backtests.py
 ```
 
-The batch summary reports win rate, profit factor, max drawdown, return, and trade count. It uses each CSV's spread/point values, 2 points of adverse slippage, and a 20-point fallback spread when historical spread is zero/missing. Signals are evaluated after the M15 candle closes; OHLC bars touching stop and target together assume stop first. The model uses one trade at a time and does not include swaps, latency, partial fills, or broker contract-value differences. Backtest metrics are historical simulations, not expected or guaranteed results.
+The batch summary reports win rate, profit factor, max drawdown, return, and trade count, and writes the complete comparison to `data/historical_12m/backtest_summary.csv`. It uses each CSV's spread/point values, 2 points of adverse slippage, and a 20-point fallback spread when historical spread is zero/missing. Signals are evaluated after the M15 candle closes; OHLC bars touching stop and target together assume stop first. The model uses one trade at a time and does not include swaps, latency, partial fills, or broker contract-value differences. Backtest metrics are historical simulations, not expected or guaranteed results.
 
 Standalone CSV command:
 

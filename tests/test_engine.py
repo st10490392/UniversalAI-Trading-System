@@ -3,7 +3,8 @@ import pandas as pd
 import pytest
 
 import brain
-from backtest import _resample_h1, _walk_exit, run_backtest
+from backtest import _resample_h1, _smc_side_at, _walk_exit, run_backtest
+from tools.export_mt5_history import classify_symbol
 
 
 def test_quant_gate_and_directional_z_filter():
@@ -24,6 +25,7 @@ def test_bullish_sweep_followed_by_fvg():
     setup=brain.detect_smc(d,"BULLISH")
     assert setup and setup["side"]=="BUY"
     assert setup["sweep_bar"]==23 and setup["fvg_bar"]==25
+    assert _smc_side_at(d.high.to_numpy(),d.low.to_numpy(),d.close.to_numpy(),25,"BULLISH")==setup["side"]
 
 
 @pytest.mark.parametrize("side,values,expected",[
@@ -43,6 +45,23 @@ def test_synthetic_detection_and_utc_sessions():
     assert not brain.is_synthetic("EURUSD")
     assert brain.in_kill_zone(datetime(2025,1,1,8,0,tzinfo=timezone.utc))
     assert not brain.in_kill_zone(datetime(2025,1,1,11,0,tzinfo=timezone.utc))
+    assert brain.is_synthetic("Range Break 200 Index")
+
+
+@pytest.mark.parametrize("symbol,family",[
+    ("Volatility 150 (1s) Index","Volatility"),
+    ("Boom 900 Index","Boom/Crash"),
+    ("Skew Step Index 5 Up","Step"),
+    ("Jump 100 Index","Jump"),
+    ("Range Break 200 Index","Range Break"),
+    ("EURUSD.a","Major FX"),
+    ("XAUUSD.a","Metals"),
+    ("US Tech 100","NASDAQ"),
+    ("Germany 40","GER30"),
+    ("Wall Street 30","US30"),
+])
+def test_market_watch_family_matching(symbol,family):
+    assert family in classify_symbol(symbol)
 
 
 def test_m15_export_times_resample_to_completed_h1_bars():
@@ -80,10 +99,12 @@ def test_api_license_binding_admin_and_immediate_poll_revoke(monkeypatch,tmp_pat
     license_row=client.get("/api/admin/licenses",headers=admin).json()[0]
     assert license_row["bound_account_id"]=="123" and license_row["bound_device_id"]=="device-uuid-001"
     monkeypatch.setattr(brain,"analyze_symbol",lambda *args,**kwargs:None)
-    poll=client.get("/api/ea/poll/123/EURUSD?balance=10000&equity=9900",headers={"X-License-Key":key})
+    poll=client.get("/api/ea/poll/123/EURUSD",headers={"X-License-Key":key,"X-Account-Balance":"10000","X-Account-Equity":"9900"})
     assert poll.status_code==200 and poll.json()["decision"]=="WAIT"
     assert poll.json()["max_daily_dd_pct"]==4
     assert client.get("/api/accounts/123/status",headers=headers).json()["account"]["active"]==1
+    state=client.get("/api/accounts/123/status",headers=headers).json()["state"]
+    assert state["balance"]==10000 and state["equity"]==9900
     assert client.post(f"/api/admin/licenses/{key}/toggle",json={"is_active":False},headers=admin).status_code==200
     assert client.get("/api/ea/poll/123/EURUSD",headers={"X-License-Key":key}).json()=={"command":"UNAUTHORIZED"}
 

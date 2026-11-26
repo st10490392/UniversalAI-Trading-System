@@ -23,6 +23,7 @@ string pending_signal="";
 string pending_signal_id="";
 double last_signal_epoch=0.0;
 datetime pending_after=0;
+datetime last_transport_log=0;
 
 string SignalStateKey()
 { return "UAI_"+(string)AccountInfoInteger(ACCOUNT_LOGIN)+"_"+(string)MagicNumber+"_"+StringSubstr(_Symbol,0,20); }
@@ -100,12 +101,25 @@ bool SendPoll(string &response)
 {
    long login=AccountInfoInteger(ACCOUNT_LOGIN);
    string safe_symbol=_Symbol;StringReplace(safe_symbol,"%","%25");StringReplace(safe_symbol," ","%20");StringReplace(safe_symbol,"#","%23");
-   string url=ServerURL+"/api/ea/poll/"+(string)login+"/"+safe_symbol+
-      "?balance="+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+
-      "&equity="+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2);
-   char data[],result[];string request_headers="X-License-Key: "+LicenseKey+"\r\n",response_headers="";
+   string url=ServerURL+"/api/ea/poll/"+(string)login+"/"+safe_symbol;
+   char data[],result[];
+   string request_headers="X-License-Key: "+LicenseKey+"\r\n"+
+      "X-Account-Balance: "+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+"\r\n"+
+      "X-Account-Equity: "+DoubleToString(AccountInfoDouble(ACCOUNT_EQUITY),2)+"\r\n";
+   string response_headers="";
    ResetLastError();int code=WebRequest("GET",url,request_headers,5000,data,result,response_headers);
-   if(code<200 || code>=300){Print("UniversalAI poll failed HTTP=",code," err=",GetLastError());return false;}
+   if(code<200 || code>=300)
+   {
+      int err=GetLastError();datetime now=TimeLocal();
+      if(last_transport_log==0 || now-last_transport_log>=60)
+      {
+         if(code==-1 && err==4014)Print("UniversalAI WebRequest is not allowed in this context. Add ",ServerURL," to MT5 Tools > Options > Expert Advisors, and run this as an EA outside Strategy Tester.");
+         else Print("UniversalAI poll transport failed HTTP=",code," err=",err," url=",ServerURL);
+         last_transport_log=now;
+      }
+      return false;
+   }
+   last_transport_log=0;
    response=CharArrayToString(result,0,-1,CP_UTF8);return true;
 }
 
