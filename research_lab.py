@@ -7,7 +7,6 @@ The XGBoost model is fitted only on labelled 2020-2023 breakouts and predicts 20
 from __future__ import annotations
 
 import argparse
-from collections import Counter
 from datetime import datetime, timezone
 import json
 import math
@@ -230,9 +229,12 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
     else:
         # Fallback is specified as round-turn points, so it is charged once.
         cost_r=max(commission_points,0.0)*point/risk
-    out_price=None; outcome="timeout"; last=min(end_idx,entry_i+horizon)
+    out_price=None; outcome="timeout"; last=min(end_idx,entry_i+horizon); mae=mfe=0.0
     for j in range(entry_i,last):
         op=float(d.open.iloc[j]); hi=float(d.high.iloc[j]); lo=float(d.low.iloc[j]); spr=max(float(d.spread_points.iloc[j]),0.0)*max(float(d.point_size.iloc[j]),0.0)
+        # Intratrade excursions in R (adverse/favourable), used for floating-equity DD checks.
+        if side>0: mae=max(mae,(entry-lo)/risk); mfe=max(mfe,(hi-entry)/risk)
+        else: mae=max(mae,(hi+spr-entry)/risk); mfe=max(mfe,(entry-lo-spr)/risk)
         if side>0:
             stop_hit=lo<=stop
             tp_hit=hi>=target
@@ -260,7 +262,7 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
         # A short is bought back at ask (bid close + spread), not bid minus spread.
         out_price=float(d.close.iloc[j])+(max(float(d.spread_points.iloc[j]),0.0)*point if side<0 else 0.0)-side*max(slippage_points,0.0)*point
     r=side*(out_price-entry)/risk-cost_r
-    return {"time":d.time.iloc[entry_i].isoformat(),"r":float(r),"outcome":outcome,"entry":float(entry),"exit":float(out_price),"bars_held":int(j-entry_i+1),"entry_delay_bars":entry_delay_bars}
+    return {"time":d.time.iloc[entry_i].isoformat(),"exit_time":d.time.iloc[j].isoformat(),"r":float(r),"mae_r":float(max(mae,0.0)),"mfe_r":float(max(mfe,0.0)),"outcome":outcome,"entry":float(entry),"exit":float(out_price),"bars_held":int(j-entry_i+1),"entry_delay_bars":entry_delay_bars}
 
 
 def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray], *, start: str, end: str, commission_per_lot: float=7.0, slippage_points: float=2.0, commission_points: float=1.0, breakeven: bool=False, horizon: int=96, spread_multiplier: float=1.0, spread_fallback_points: float=20.0, entry_delay_bars: int=0, random_delay_max_bars: int=0, seed: int=42) -> list[dict[str,Any]]:
@@ -285,23 +287,104 @@ def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray
     return trades
 
 
-def _stats(trades: list[dict[str,Any]], risk_pct: float=.75) -> dict[str,Any]:
-    eq=peak=1.0; maxdd=0.0; day_start=1.0; day_key=None; stopped_days=set(); stopped=False; month_ends={}; executed=[]
-    for t in trades:
-        r=float(t["r"])
-        dt=pd.Timestamp(t["time"]); day=dt.date(); month=dt.strftime("%Y-%m")
-        if day!=day_key: day_key=day; day_start=eq
-        if stopped or day in stopped_days: continue
-        executed.append(r)
-        eq*=max(0.0,1.0+r*risk_pct/100.0); peak=max(peak,eq); dd=(peak-eq)/peak*100; maxdd=max(maxdd,dd)
-        if (day_start-eq)/max(day_start,1e-12)*100>=DAILY_DD_LIMIT_PCT: stopped_days.add(day)
-        if dd>=TOTAL_DD_LIMIT_PCT: stopped=True
-        month_ends[month]=eq
-    rs=np.asarray(executed,dtype=float)
-    wins=rs[rs>0].sum(); losses=-rs[rs<0].sum(); pf=float(wins/losses) if losses>0 else (None if wins>0 else 0.0)
-    vals=list(month_ends.values()); mrets=[]; prev=1.0
-    for value in vals: mrets.append(value/prev-1);prev=value
-    return {"trades":len(executed),"win_rate_pct":float((rs>0).mean()*100) if len(rs) else 0.0,"profit_factor":pf,"total_return_pct":(eq-1)*100,"max_drawdown_pct":maxdd,"average_monthly_return_pct":float(np.mean(mrets)*100) if mrets else 0.0,"sharpe_ratio":float(np.mean(mrets)/np.std(mrets,ddof=1)*math.sqrt(12)) if len(mrets)>1 and np.std(mrets,ddof=1)>0 else 0.0}
+SIZING_MODES = ("fractional", "fixed", "capped", "vol_target", "dd_throttle")
+DD_BASES = ("trailing", "static")
+MC_METHODS = ("permute", "bootstrap", "block")
+
+
+def _sizing_kwargs(args: argparse.Namespace) -> dict[str, Any]:
+    return {"mode": args.sizing_mode, "dd_basis": args.dd_basis, "cap_mult": args.sizing_cap}
+
+
+def _pf(rs: np.ndarray) -> float | None:
+    wins = rs[rs > 0].sum(); losses = -rs[rs < 0].sum()
+    return float(wins / losses) if losses > 0 else (None if wins > 0 else 0.0)
+
+
+def _trade_arrays(trades: list[dict[str, Any]]) -> dict[str, Any]:
+    """Canonical trade population shared by _stats and _monte_carlo.
+
+    Order and day/month buckets use the EXIT timestamp (when PnL is realised); falls back
+    to entry time for trades without exit_time. mae_r/mfe_r default to 0 (closed-trade DD only).
+    """
+    key = lambda t: pd.Timestamp(t.get("exit_time", t["time"]))
+    ordered = sorted(trades, key=key)
+    rs = np.asarray([float(t["r"]) for t in ordered], dtype=float)
+    if not np.isfinite(rs).all(): raise ValueError("trade R outcomes must be finite")
+    stamps = pd.DatetimeIndex([key(t) for t in ordered])
+    days = pd.factorize(stamps.normalize())[0] if len(rs) else np.zeros(0, dtype=int)
+    months = pd.factorize(stamps.strftime("%Y-%m"))[0] if len(rs) else np.zeros(0, dtype=int)
+    month_last = np.flatnonzero(np.r_[months[1:] != months[:-1], True]) if len(rs) else np.zeros(0, dtype=int)
+    return {"rs": rs, "days": days, "month_last": month_last,
+            "mae": np.asarray([float(t.get("mae_r", 0.0)) for t in ordered], dtype=float),
+            "mfe": np.asarray([float(t.get("mfe_r", 0.0)) for t in ordered], dtype=float)}
+
+
+def _gate_path(rs: np.ndarray, days: np.ndarray, *, risk_pct: float=.75, mode: str="fractional", dd_basis: str="trailing", cap_mult: float=3.0,
+               daily_limit_pct: float=DAILY_DD_LIMIT_PCT, total_limit_pct: float=TOTAL_DD_LIMIT_PCT, target_pct: float|None=None,
+               mae: np.ndarray|None=None, mfe: np.ndarray|None=None, enforce: bool=True, vol_alpha: float=.05, vol_ref: float=1.5) -> dict[str, Any]:
+    """Single sizing + equity + risk-gate engine (used by BOTH chronological stats and Monte Carlo).
+
+    Equity is normalised to 1.0. Per-trade risk in equity units (1R = `unit`):
+      fractional : rho*eq                         (compounding; log-additive)
+      fixed      : rho*1.0                        (fixed-dollar on initial balance)
+      capped     : rho*min(eq, cap_mult)          (compound until eq=cap_mult, then fixed-dollar)
+      vol_target : rho*eq*clip(vol_ref/rms_R_ewma, .5, 1.5)   (causal EWMA of realised R^2, after 20 trades)
+      dd_throttle: rho*eq*max(0, 1 - dd/(0.8*total_limit))    (de-risk linearly into the limit)
+    dd_basis: "trailing" = (peak-eq)/peak (high-water mark); "static" = (1-eq) from initial balance.
+    Floating equity: trough = eq - unit*max(MAE, -r, 0) (adverse leg from trade start; no MFE/MAE order assumption);
+    peak is raised by eq + unit*max(MFE, r, 0). enforce=False records events but never halts (uncensored DD).
+    """
+    if mode not in SIZING_MODES: raise ValueError(f"unknown sizing mode {mode!r}")
+    if dd_basis not in DD_BASES: raise ValueError(f"unknown dd_basis {dd_basis!r}")
+    n = len(rs); rho = risk_pct / 100.0
+    executed = np.zeros(n, dtype=bool); curve = np.ones(n)
+    eq = peak = day_start = 1.0; cur = None; day_hit = halted = False
+    mdd_tr = mdd_st = 0.0; daily = total = zero = passed = False; first_breach = -1; var = 0.0; seen = 0
+    for k in range(n):
+        if days[k] != cur: cur = days[k]; day_start = eq; day_hit = False
+        if enforce and (day_hit or halted): curve[k] = eq; continue
+        r = float(rs[k])
+        dd_now = (peak - eq) / peak * 100.0 if dd_basis == "trailing" else max(0.0, 1.0 - eq) * 100.0
+        if mode == "fractional": unit = rho * eq
+        elif mode == "fixed": unit = rho
+        elif mode == "capped": unit = rho * min(eq, cap_mult)
+        elif mode == "vol_target": unit = rho * eq * (min(max(vol_ref / math.sqrt(var), .5), 1.5) if seen >= 20 and var > 0 else 1.0)
+        else: unit = rho * eq * max(0.0, 1.0 - dd_now / (.8 * total_limit_pct))
+        adverse = max(float(mae[k]) if mae is not None else 0.0, -r, 0.0)
+        favour = max(float(mfe[k]) if mfe is not None else 0.0, r, 0.0)
+        trough = max(0.0, eq - unit * adverse); top = eq + unit * favour
+        dd_tr = (peak - trough) / peak * 100.0; dd_st = max(0.0, 1.0 - trough) * 100.0
+        daily_dd = (day_start - trough) / max(day_start, 1e-12) * 100.0
+        eq = max(0.0, eq + unit * r); executed[k] = True; seen += 1
+        var = r * r if seen == 1 else (1.0 - vol_alpha) * var + vol_alpha * r * r
+        peak = max(peak, top); mdd_tr = max(mdd_tr, dd_tr); mdd_st = max(mdd_st, dd_st); curve[k] = eq
+        if daily_dd >= daily_limit_pct: daily = day_hit = True
+        if (dd_tr if dd_basis == "trailing" else dd_st) >= total_limit_pct:
+            total = True; halted = True; first_breach = k if first_breach < 0 else first_breach
+        elif target_pct is not None and enforce and eq >= 1.0 + target_pct / 100.0: passed = halted = True
+        if eq <= 0.0: zero = halted = True
+    return {"executed": executed, "curve": curve, "final_eq": eq, "max_dd_trailing_pct": mdd_tr, "max_dd_static_pct": mdd_st,
+            "max_dd_pct": mdd_tr if dd_basis == "trailing" else mdd_st, "daily_breach": daily, "total_breach": total,
+            "equity_zero": zero, "target_passed": passed, "first_breach_idx": first_breach}
+
+
+def _stats(trades: list[dict[str,Any]], risk_pct: float=.75, *, mode: str="fractional", dd_basis: str="trailing", cap_mult: float=3.0, target_pct: float|None=None, enforce: bool=True) -> dict[str,Any]:
+    """Headline fields describe the GATED path; ungated_* describe the full signal population that _monte_carlo permutes."""
+    a = _trade_arrays(trades)
+    kw = dict(risk_pct=risk_pct, mode=mode, dd_basis=dd_basis, cap_mult=cap_mult, mae=a["mae"], mfe=a["mfe"])
+    g = _gate_path(a["rs"], a["days"], target_pct=target_pct, enforce=enforce, **kw)
+    u = _gate_path(a["rs"], a["days"], enforce=False, **kw)
+    rs = a["rs"][g["executed"]]; ml = a["month_last"]
+    vals = g["curve"][ml]; mrets = np.diff(np.r_[1.0, vals]) / np.r_[1.0, vals[:-1]] if len(ml) else np.zeros(0)
+    sd = float(np.std(mrets, ddof=1)) if len(mrets) > 1 else 0.0
+    return {"trades": int(len(rs)), "win_rate_pct": float((rs > 0).mean() * 100) if len(rs) else 0.0, "profit_factor": _pf(rs),
+            "total_return_pct": (g["final_eq"] - 1) * 100, "max_drawdown_pct": g["max_dd_trailing_pct"], "max_drawdown_static_pct": g["max_dd_static_pct"],
+            "average_monthly_return_pct": float(mrets.mean() * 100) if len(mrets) else 0.0, "sharpe_ratio": float(mrets.mean() / sd * math.sqrt(12)) if sd > 0 else 0.0,
+            "signal_trades": int(len(a["rs"])), "ungated_profit_factor": _pf(a["rs"]), "ungated_total_return_pct": (u["final_eq"] - 1) * 100,
+            "ungated_max_drawdown_pct": u["max_dd_pct"], "gate_truncated": bool(len(rs) < len(a["rs"])),
+            "first_total_breach_trade": None if g["first_breach_idx"] < 0 else int(g["first_breach_idx"]),
+            "daily_limit_breached": g["daily_breach"], "total_limit_breached": g["total_breach"], "sizing_mode": mode, "dd_basis": dd_basis}
 
 
 WF_WINDOWS=(
@@ -323,7 +406,7 @@ def _walk_forward_rows(data:pd.DataFrame,signals:tuple[np.ndarray,np.ndarray,np.
             rows.append({**base,"status":"no_history" if not len(in_window) else "model_unavailable","trades":0,"trades_per_observed_month":0.0,"win_rate_pct":0.0,"profit_factor":0.0,"max_drawdown_pct":0.0,"total_return_pct":0.0})
             continue
         trades=simulate(data,signals,start=start,end=end,commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points,breakeven=(strategy_id=="A"))
-        stats=_stats(trades,risk_pct=args.report_risk_pct)
+        stats=_stats(trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args))
         rows.append({**base,"status":"evaluated","trades":stats["trades"],"trades_per_observed_month":stats["trades"]/max(base["observed_months"],1),"win_rate_pct":stats["win_rate_pct"],"profit_factor":stats["profit_factor"],"max_drawdown_pct":stats["max_drawdown_pct"],"total_return_pct":stats["total_return_pct"],"average_monthly_return_pct":stats["average_monthly_return_pct"],"sharpe_ratio":stats["sharpe_ratio"]})
     return rows
 
@@ -349,11 +432,11 @@ def _stress_rows(data:pd.DataFrame,signals:tuple[np.ndarray,np.ndarray,np.ndarra
             base_trades=trades
         else:
             trades=simulate(data,signals,start="2024-01-01",end="2026-01-01",commission_per_lot=commission,slippage_points=slip,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points,breakeven=(strategy_id=="A"),spread_multiplier=spread_mult,entry_delay_bars=delay,random_delay_max_bars=random_delay,seed=args.seed)
-        stats=_stats(trades,risk_pct=args.report_risk_pct)
+        stats=_stats(trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args))
         rows.append({**common,"scenario":name,"risk_pct":args.report_risk_pct,"spread_multiplier":spread_mult,"slippage_points":slip,"commission_per_lot":commission,"trades":stats["trades"],"win_rate_pct":stats["win_rate_pct"],"profit_factor":stats["profit_factor"],"max_drawdown_pct":stats["max_drawdown_pct"],"total_return_pct":stats["total_return_pct"]})
     assert base_trades is not None
     for risk_pct in (.5,.75,1.0,1.5):
-        stats=_stats(base_trades,risk_pct=risk_pct)
+        stats=_stats(base_trades,risk_pct=risk_pct,**_sizing_kwargs(args))
         rows.append({**common,"scenario":f"risk_{risk_pct:g}pct","risk_pct":risk_pct,"spread_multiplier":1.0,"slippage_points":args.slippage_points,"commission_per_lot":args.commission_per_lot,"trades":stats["trades"],"win_rate_pct":stats["win_rate_pct"],"profit_factor":stats["profit_factor"],"max_drawdown_pct":stats["max_drawdown_pct"],"total_return_pct":stats["total_return_pct"]})
     return rows
 
@@ -396,55 +479,56 @@ def _fit_xgb(d: pd.DataFrame, raw: tuple[np.ndarray,np.ndarray,np.ndarray,np.nda
     return model,len(yi),"trained on 2020-2023 only"
 
 
-def _monte_carlo(trades: list[dict[str,Any]], *, iterations: int=1000, risk_pct: float=.75, seed: int=42, daily_limit_pct: float=DAILY_DD_LIMIT_PCT, total_limit_pct: float=TOTAL_DD_LIMIT_PCT) -> dict[str,float]:
-    """Permute net R outcomes without replacement, preserving chronological daily trade counts.
+def _resample_idx(n: int, rng: np.random.Generator, method: str, block_len: int) -> np.ndarray:
+    if method == "permute": return rng.permutation(n)        # exact population; terminal equity is order-invariant under compounding
+    if method == "bootstrap": return rng.integers(0, n, n)   # iid with replacement; gives terminal-return dispersion
+    if method == "block":                                     # circular stationary bootstrap; preserves R autocorrelation / regimes
+        starts = rng.integers(0, n, n); jumps = rng.random(n) < 1.0 / max(block_len, 1); jumps[0] = True
+        pos = np.arange(n); last = np.maximum.accumulate(np.where(jumps, pos, 0))
+        return (starts[last] + pos - last) % n
+    raise ValueError(f"unknown Monte Carlo method {method!r}")
 
-    "Ruin" in legacy output means either prop drawdown limit was breached. It does
-    not mean equity reached zero. Separate event probabilities are returned.
+
+def _monte_carlo(trades: list[dict[str,Any]], *, iterations: int=1000, risk_pct: float=.75, seed: int=42, daily_limit_pct: float=DAILY_DD_LIMIT_PCT, total_limit_pct: float=TOTAL_DD_LIMIT_PCT,
+                 mode: str="fractional", dd_basis: str="trailing", cap_mult: float=3.0, method: str="permute", block_len: int=10, target_pct: float|None=None) -> dict[str,float]:
+    """Resample net R outcomes onto the chronological day/exit slots and run the SAME _gate_path as _stats.
+
+    Pass the full pre-gate trade list (what simulate() returns); the gate is re-applied per path. Reports the
+    chronological path under the identical engine so the two populations are provably the same. "Ruin" means
+    either prop limit breached, not equity zero. p95_max_drawdown_pct is CENSORED at the first breach (it is
+    pinned in [limit, limit + one-trade loss)); use p95_max_drawdown_uncensored_pct for tail risk.
     """
     if iterations<1 or not (0<risk_pct<=100) or daily_limit_pct<=0 or total_limit_pct<=0:
         raise ValueError("invalid Monte Carlo configuration")
+    if method not in MC_METHODS: raise ValueError(f"unknown Monte Carlo method {method!r}")
+    extra = ("p95_max_drawdown_uncensored_pct","probability_target_before_breach_pct","terminal_return_std_pct","chrono_total_return_pct","chrono_max_drawdown_uncensored_pct","chrono_dd_percentile","chrono_either_limit_breached")
     if not trades:
-        return {"iterations":iterations,"seed":seed,"risk_pct":risk_pct,"p95_max_drawdown_pct":0.0,"probability_daily_limit_breach_pct":0.0,"probability_total_limit_breach_pct":0.0,"probability_either_limit_breach_pct":0.0,"probability_both_limits_breach_pct":0.0,"probability_equity_zero_pct":0.0,"probability_of_ruin_pct":0.0,"average_monthly_return_pct":0.0,"sharpe_ratio":0.0,"median_total_return_pct":0.0}
-    ordered=sorted(trades,key=lambda t:pd.Timestamp(t["time"]))
-    rs=np.asarray([float(t["r"]) for t in ordered],dtype=float)
-    if not np.isfinite(rs).all():raise ValueError("trade R outcomes must be finite")
-    dates=[pd.Timestamp(t["time"]) for t in ordered]
-    day_counts=list(Counter(d.date() for d in dates).items())
-    rng=np.random.default_rng(seed); dds=[]; returns=[]; all_monthly=[]
-    daily_hits=total_hits=both_hits=zero_hits=0
+        return {"iterations":iterations,"seed":seed,"risk_pct":risk_pct,"population_trades":0,"method":method,"sizing_mode":mode,"dd_basis":dd_basis,"p95_max_drawdown_pct":0.0,"probability_daily_limit_breach_pct":0.0,"probability_total_limit_breach_pct":0.0,"probability_either_limit_breach_pct":0.0,"probability_both_limits_breach_pct":0.0,"probability_equity_zero_pct":0.0,"probability_of_ruin_pct":0.0,"average_monthly_return_pct":0.0,"sharpe_ratio":0.0,"median_total_return_pct":0.0,**{k:0.0 for k in extra}}
+    a = _trade_arrays(trades); rs, days, mae, mfe, ml = a["rs"], a["days"], a["mae"], a["mfe"], a["month_last"]; n = len(rs)
+    kw = dict(risk_pct=risk_pct, mode=mode, dd_basis=dd_basis, cap_mult=cap_mult, daily_limit_pct=daily_limit_pct, total_limit_pct=total_limit_pct)
+    chrono = _gate_path(rs, days, mae=mae, mfe=mfe, target_pct=target_pct, enforce=True, **kw)
+    chrono_free = _gate_path(rs, days, mae=mae, mfe=mfe, enforce=False, **kw)
+    rng = np.random.default_rng(seed); dd_cens = []; dd_free = []; free_ret = []; returns = []; all_monthly = []
+    daily_hits = total_hits = both_hits = zero_hits = pass_hits = 0
     for _ in range(iterations):
-        shuffled=rng.permutation(rs); eq=peak=1.0; maxdd=0.0; cursor=0
-        daily_breached=total_breached=equity_zero=False
-        month_values={}; current_month=None; month_start=1.0
-        for day,day_n in day_counts:
-            day_start=eq; day_hit=False
-            for r in shuffled[cursor:cursor+day_n]:
-                cursor+=1
-                if day_hit or total_breached or equity_zero:continue
-                eq=max(0.0,eq*(1.0+r*risk_pct/100.0))
-                if eq<=0.0:equity_zero=True
-                peak=max(peak,eq)
-                dd=(peak-eq)/peak*100.0 if peak>0 else 100.0
-                maxdd=max(maxdd,dd)
-                daily_dd=(day_start-eq)/max(day_start,1e-12)*100.0
-                if daily_dd>=daily_limit_pct:
-                    daily_breached=True;day_hit=True
-                if dd>=total_limit_pct:
-                    total_breached=True
-            month=day.strftime("%Y-%m")
-            if current_month is None:
-                current_month=month;month_start=1.0
-            elif month!=current_month:
-                month_values[current_month]=eq/max(month_start,1e-12)-1.0
-                current_month=month;month_start=eq
-        if current_month is not None:month_values[current_month]=eq/max(month_start,1e-12)-1.0
-        dds.append(maxdd);returns.append((eq-1.0)*100.0);all_monthly.extend(v*100.0 for v in month_values.values())
-        daily_hits+=int(daily_breached);total_hits+=int(total_breached);both_hits+=int(daily_breached and total_breached);zero_hits+=int(equity_zero)
-    either_hits=daily_hits+total_hits-both_hits
-    monthly=np.asarray(all_monthly,dtype=float)
-    p_daily=daily_hits/iterations*100.0;p_total=total_hits/iterations*100.0;p_either=either_hits/iterations*100.0
-    return {"iterations":iterations,"seed":seed,"risk_pct":risk_pct,"daily_limit_pct":daily_limit_pct,"total_limit_pct":total_limit_pct,"p95_max_drawdown_pct":float(np.percentile(dds,95)),"probability_daily_limit_breach_pct":p_daily,"probability_total_limit_breach_pct":p_total,"probability_either_limit_breach_pct":p_either,"probability_both_limits_breach_pct":both_hits/iterations*100.0,"probability_equity_zero_pct":zero_hits/iterations*100.0,"probability_of_ruin_pct":p_either,"average_monthly_return_pct":float(monthly.mean()) if len(monthly) else 0.0,"sharpe_ratio":float(monthly.mean()/monthly.std(ddof=1)*math.sqrt(12)) if len(monthly)>1 and monthly.std(ddof=1)>0 else 0.0,"median_total_return_pct":float(np.median(returns))}
+        idx = _resample_idx(n, rng, method, block_len); rr, mm, ff = rs[idx], mae[idx], mfe[idx]
+        g = _gate_path(rr, days, mae=mm, mfe=ff, target_pct=target_pct, enforce=True, **kw)
+        u = _gate_path(rr, days, mae=mm, mfe=ff, enforce=False, **kw)
+        dd_cens.append(g["max_dd_pct"]); dd_free.append(u["max_dd_pct"]); returns.append((g["final_eq"] - 1.0) * 100.0); free_ret.append((u["final_eq"] - 1.0) * 100.0)
+        vals = g["curve"][ml]; all_monthly.extend((np.diff(np.r_[1.0, vals]) / np.r_[1.0, vals[:-1]] * 100.0).tolist())
+        daily_hits += int(g["daily_breach"]); total_hits += int(g["total_breach"]); both_hits += int(g["daily_breach"] and g["total_breach"])
+        zero_hits += int(g["equity_zero"]); pass_hits += int(g["target_passed"])
+    either_hits = daily_hits + total_hits - both_hits; monthly = np.asarray(all_monthly, dtype=float)
+    p_daily = daily_hits / iterations * 100.0; p_total = total_hits / iterations * 100.0; p_either = either_hits / iterations * 100.0
+    return {"iterations":iterations,"seed":seed,"risk_pct":risk_pct,"daily_limit_pct":daily_limit_pct,"total_limit_pct":total_limit_pct,"population_trades":n,"method":method,"sizing_mode":mode,"dd_basis":dd_basis,
+            "p95_max_drawdown_pct":float(np.percentile(dd_cens,95)),"p95_max_drawdown_uncensored_pct":float(np.percentile(dd_free,95)),
+            "probability_daily_limit_breach_pct":p_daily,"probability_total_limit_breach_pct":p_total,"probability_either_limit_breach_pct":p_either,"probability_both_limits_breach_pct":both_hits/iterations*100.0,
+            "probability_equity_zero_pct":zero_hits/iterations*100.0,"probability_of_ruin_pct":p_either,"probability_target_before_breach_pct":pass_hits/iterations*100.0 if target_pct is not None else 0.0,
+            "average_monthly_return_pct":float(monthly.mean()) if len(monthly) else 0.0,"sharpe_ratio":float(monthly.mean()/monthly.std(ddof=1)*math.sqrt(12)) if len(monthly)>1 and monthly.std(ddof=1)>0 else 0.0,
+            "median_total_return_pct":float(np.median(returns)),"terminal_return_std_pct":float(np.std(free_ret)),
+            "chrono_total_return_pct":(chrono["final_eq"]-1.0)*100.0,"chrono_max_drawdown_uncensored_pct":chrono_free["max_dd_pct"],
+            "chrono_dd_percentile":float(np.mean(np.asarray(dd_free)<=chrono_free["max_dd_pct"])*100.0),
+            "chrono_either_limit_breached":bool(chrono["daily_breach"] or chrono["total_breach"])}
 
 
 def live_candidates(symbol: str, data: pd.DataFrame, strategies: list[str], model_dir: Path|None=None) -> list[dict[str,Any]]:
@@ -486,7 +570,7 @@ def run(args: argparse.Namespace) -> tuple[list[dict[str,Any]],list[dict[str,Any
                 raw=build_signals(d,symbol,"D"); model,train_n,train_note=_fit_xgb(d,raw,start="2020-01-01",cutoff="2024-01-01",args=args,model_path=model_dir/(re.sub(r"[^A-Za-z0-9]+","_",symbol).strip("_")+"_D.json"))
                 if model is None:
                     eval_signals=tuple(arr.copy() for arr in raw);eval_signals[0][:]=0;model_trained=False
-                    result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(simulate(d,raw,start="2020-01-01",end="2024-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points),risk_pct=args.report_risk_pct),"oos":{"trades":0,"win_rate_pct":0.0,"profit_factor":0.0,"total_return_pct":0.0,"max_drawdown_pct":0.0,"average_monthly_return_pct":0.0,"sharpe_ratio":0.0},"training_trades":train_n,"model_status":train_note,"monte_carlo":None}
+                    result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(simulate(d,raw,start="2020-01-01",end="2024-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points),risk_pct=args.report_risk_pct,**_sizing_kwargs(args)),"oos":{"trades":0,"win_rate_pct":0.0,"profit_factor":0.0,"total_return_pct":0.0,"max_drawdown_pct":0.0,"average_monthly_return_pct":0.0,"sharpe_ratio":0.0},"training_trades":train_n,"model_status":train_note,"monte_carlo":None}
                 else:
                     candidates=np.flatnonzero((raw[0]!=0)&(d.time>=pd.Timestamp("2024-01-01",tz="UTC")).to_numpy()&(d.time<pd.Timestamp("2026-01-01",tz="UTC")).to_numpy())
                     import xgboost as xgb
@@ -497,17 +581,18 @@ def run(args: argparse.Namespace) -> tuple[list[dict[str,Any]],list[dict[str,Any
                     eval_signals=gated;model_trained=True
                     is_trades=simulate(d,raw,start="2020-01-01",end="2024-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points)
                     oos_trades=simulate(d,gated,start="2024-01-01",end="2026-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points)
-                    result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(is_trades,risk_pct=args.report_risk_pct),"oos":_stats(oos_trades,risk_pct=args.report_risk_pct),"training_trades":train_n,"model_status":train_note,"monte_carlo":None}
+                    result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(is_trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args)),"oos":_stats(oos_trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args)),"training_trades":train_n,"model_status":train_note,"monte_carlo":None}
             else:
                 sig=build_signals(d,symbol,key)
                 eval_signals=sig;model_trained=False
                 is_trades=simulate(d,sig,start="2020-01-01",end="2024-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points,breakeven=(key=="A"))
                 oos_trades=simulate(d,sig,start="2024-01-01",end="2026-01-01",commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,spread_fallback_points=args.spread_fallback_points,breakeven=(key=="A"))
-                result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(is_trades,risk_pct=args.report_risk_pct),"oos":_stats(oos_trades,risk_pct=args.report_risk_pct),"training_trades":None,"model_status":"rules only","monte_carlo":None}
+                result={"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"is":_stats(is_trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args)),"oos":_stats(oos_trades,risk_pct=args.report_risk_pct,**_sizing_kwargs(args)),"training_trades":None,"model_status":"rules only","monte_carlo":None}
             result["walk_forward"]=_walk_forward_rows(d,eval_signals,symbol,name,key,trained=model_trained,args=args)
             result["stress"]=[]
-            if result["oos"]["trades"]>=args.mc_min_trades and (result["oos"]["profit_factor"] or 0)>=args.mc_min_pf:
-                result["monte_carlo"]=_monte_carlo(oos_trades,iterations=args.mc_iterations,risk_pct=args.mc_risk_pct,seed=args.seed+ix*100+ord(key))
+            if result["oos"].get("signal_trades",0)>=args.mc_min_trades and (result["oos"].get("ungated_profit_factor") or 0)>=args.mc_min_pf:
+                result["monte_carlo"]=_monte_carlo(oos_trades,iterations=args.mc_iterations,risk_pct=args.mc_risk_pct,seed=args.seed+ix*100+ord(key),mode=args.sizing_mode,dd_basis=args.dd_basis,cap_mult=args.sizing_cap,method=args.mc_method,block_len=args.mc_block,target_pct=args.target_pct)
+                assert result["monte_carlo"]["population_trades"]==result["oos"]["signal_trades"],"OOS stats and Monte Carlo must evaluate the same trade population"
                 result["stress"]=_stress_rows(d,eval_signals,symbol,name,key,args)
                 approved.append({"symbol":symbol,"asset_class":asset,"strategy":name,"strategy_id":key,"rule":_rule_spec(key),"oos":result["oos"],"monte_carlo":result["monte_carlo"],"model_path":str((model_dir/(re.sub(r"[^A-Za-z0-9]+","_",symbol).strip("_")+"_D.json")).relative_to(ROOT)) if key=="D" else None})
             all_results.append(result)
@@ -543,10 +628,17 @@ def main() -> int:
     parser.add_argument("--mc-risk-pct",type=float,default=.75)
     parser.add_argument("--max-ruin-pct",type=float,default=5.0,help="max Monte Carlo prop-ruin probability to approve a pair")
     parser.add_argument("--max-p95-drawdown-pct",type=float,default=10.0,help="max 95th-percentile Monte Carlo drawdown to approve a pair")
+    parser.add_argument("--sizing-mode",choices=SIZING_MODES,default="fractional",help="per-R risk rule used by walk-forward, stress and Monte Carlo")
+    parser.add_argument("--sizing-cap",type=float,default=3.0,help="equity multiple (x initial) at which 'capped' compounding stops")
+    parser.add_argument("--dd-basis",choices=DD_BASES,default="trailing",help="total-DD reference: trailing high-water mark or static initial balance")
+    parser.add_argument("--mc-method",choices=MC_METHODS,default="permute")
+    parser.add_argument("--mc-block",type=int,default=10,help="mean block length for --mc-method block")
+    parser.add_argument("--target-pct",type=float,default=None,help="optional profit target (%%); Monte Carlo then reports P(target before breach)")
     parser.add_argument("--xgb-threshold",type=float,default=.55)
     parser.add_argument("--seed",type=int,default=42)
     args=parser.parse_args()
     if args.mc_iterations<1 or args.mc_min_trades<1 or not (0<args.mc_risk_pct<=5) or not (0<args.report_risk_pct<=5):parser.error("invalid Monte Carlo/report risk configuration")
+    if args.sizing_cap<1 or args.mc_block<1 or (args.target_pct is not None and args.target_pct<=0):parser.error("invalid sizing cap / block length / target")
     try: results,approved=run(args)
     except Exception as exc: print(f"Research failed: {type(exc).__name__}: {exc}",file=sys.stderr); return 2
     args.output_dir.mkdir(parents=True,exist_ok=True)
@@ -571,7 +663,7 @@ def main() -> int:
     with (args.output_dir/"loss_streak_stress.csv").open("w",newline="",encoding="utf-8") as f:
         fields=sorted({k for row in streak_rows for k in row});w=__import__("csv").DictWriter(f,fieldnames=fields);w.writeheader();w.writerows(streak_rows)
     qualified=[r for r in results if r.get("monte_carlo") is not None]
-    approved=[r for r in approved if r["monte_carlo"]["probability_either_limit_breach_pct"]<=args.max_ruin_pct and r["monte_carlo"]["p95_max_drawdown_pct"]<=args.max_p95_drawdown_pct]
+    approved=[r for r in approved if r["monte_carlo"]["probability_either_limit_breach_pct"]<=args.max_ruin_pct and r["monte_carlo"]["p95_max_drawdown_uncensored_pct"]<=args.max_p95_drawdown_pct]
     payload={"generated_at":datetime.now(timezone.utc).isoformat(),"period":{"in_sample":"2020-01-01/2023-12-31","out_of_sample":"2024-01-01/2025-12-31"},"walk_forward":{"test_windows":[[x[0],x[1],x[2]] for x in WF_WINDOWS],"d_role":"2024 validation reporting only; 2025 final test; fixed threshold, no retuning"},"approval_criteria":{"oos_profit_factor_min":args.mc_min_pf,"oos_trade_count_min":args.mc_min_trades,"monte_carlo_iterations":args.mc_iterations,"risk_per_trade_pct":args.mc_risk_pct,"prop_daily_drawdown_pct":DAILY_DD_LIMIT_PCT,"prop_total_drawdown_pct":TOTAL_DD_LIMIT_PCT,"max_either_limit_breach_probability_pct":args.max_ruin_pct,"max_p95_drawdown_pct":args.max_p95_drawdown_pct},"monte_carlo_qualified":qualified,"approved":approved}
     args.approved_path.parent.mkdir(parents=True,exist_ok=True);args.approved_path.write_text(json.dumps(payload,indent=2,allow_nan=False),encoding="utf-8")
     profitable=[r for r in results if r["oos"]["total_return_pct"]>0]
