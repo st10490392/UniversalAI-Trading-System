@@ -205,3 +205,61 @@ def test_optional_prop_execution_profile(override, status, failure):
     assert result["status"] == status
     assert result["failures"] == ([failure] if failure else [])
     assert result["live_approval"] is False
+
+
+def test_walkforward_risk_normalizes_actual_fill_across_price_scales():
+    from walkforward_standard import execution_columns, walk_segment
+    from research_lab import standard_trade_stats
+
+    for scale in (.01, 1., 100.):
+        data = pd.DataFrame({
+            "time": pd.date_range("2025-01-01", periods=4, freq="15min", tz="UTC"),
+            "open": np.array([100, 101, 103, 104]) * scale,
+            "high": np.array([101, 102, 105, 105]) * scale,
+            "low": np.array([99, 100.5, 102, 103]) * scale,
+            "close": np.array([100, 101, 104, 104]) * scale,
+            "point_size": .01 * scale, "tick_size": .01 * scale, "tick_value": 0.,
+        })
+        columns = execution_columns(data, pd.Series([2.] * len(data)))
+        stops = np.array([100. * scale, np.nan, np.nan, np.nan])
+        trades = walk_segment(columns, np.array([1, 0, 0, 0]), stops,
+                              lo=0, hi=3, rr=2., slippage=2., commission=1.)
+        assert len(trades) == 1
+        entry = 101.04
+        assert trades[0]["r"] == pytest.approx(2 - .03 / (entry - 100))
+        assert standard_trade_stats(trades)["total_return_pct"] == pytest.approx(trades[0]["r"])
+
+
+def test_walkforward_selects_parameters_using_earlier_blocks_only(monkeypatch):
+    import walkforward_standard as wf
+
+    good, bad = wf.VARIANTS[:2]
+    monkeypatch.setattr(wf, "VARIANTS", (good, bad))
+    monkeypatch.setattr(wf, "signal_components", lambda *args: None)
+    monkeypatch.setattr(wf, "stop_levels", lambda *args: (None, None))
+    dates = pd.DataFrame({"time": pd.date_range("2025-01-01", periods=4, freq="D", tz="UTC")})
+
+    def block(_columns, _sides, _stops, *, lo, hi, rr, slippage, commission):
+        r = (.3 if rr == good.rr else -.3) if lo < 2 else (-.3 if rr == good.rr else .3)
+        return [{"time": dates.time.iloc[lo].isoformat(), "r": r}] * 60
+
+    monkeypatch.setattr(wf, "walk_segment", block)
+    _, stress, _, folds, _, _ = wf.evaluate_mode(dates, None, [(None, 2, 1), (None, 5, 1.5)], list(range(5)), "ema_trend_pullback")
+    assert folds[0]["development_pass"]
+    assert folds[0]["parameter_set"]["rr"] == good.rr
+    assert folds[0]["test"][1]["average_r"] == -.3
+    assert stress["trades"] == 120
+
+
+def test_walkforward_base_orb_matches_completed_bar_strategy():
+    from walkforward_standard import VARIANTS, signal_components, stop_levels
+
+    frame = pd.concat([_bars(np.linspace(98, 99.39, 36)), _orb_buy_frame()], ignore_index=True)
+    frame["time"] = pd.date_range("2025-01-01", periods=len(frame), freq="15min", tz="UTC")
+    frame["point_size"] = .01
+    spreads = pd.Series(2., index=frame.index)
+    components = signal_components(frame, "session_orb_retest_rolling", spreads)
+    sides, stops = stop_levels(frame, components, VARIANTS[0])
+    single = session_orb_retest(frame, point_value=.01, spread_points=2.)
+    assert single["command"] == "BUY"
+    assert sides[-1] == 1 and stops[-1] == pytest.approx(single["sl"])

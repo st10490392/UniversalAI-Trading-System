@@ -208,7 +208,7 @@ def build_signals(data: pd.DataFrame, symbol: str, strategy: str) -> tuple[np.nd
     return side,stop,target,code
 
 
-def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0, absolute_stop: bool=False) -> dict[str, Any] | None:
+def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0, absolute_stop: bool=False, reward_risk: float=2.5) -> dict[str, Any] | None:
     if entry_delay_bars < 0:
         raise ValueError("entry_delay_bars cannot be negative")
     entry_i=i+1+entry_delay_bars
@@ -228,7 +228,8 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
         if (side>0 and target<=entry) or (side<0 and target>=entry):
             return None
     else:
-        target=entry+side*risk*2.5
+        target=entry+side*risk*reward_risk
+        if not np.isfinite(target) or target<=0:return None
     if commission_per_lot>0 and tick_size>0 and tick_value>0:
         risk_cash=max(risk/tick_size*tick_value,1e-9); cost_r=commission_per_lot/risk_cash
     else:
