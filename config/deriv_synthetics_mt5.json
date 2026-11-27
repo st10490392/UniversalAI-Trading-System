@@ -1,0 +1,49 @@
+{
+  "version": 1,
+  "mode": "paper",
+  "risk_pct": 0.5,
+  "daily_loss_cap_pct": 2.5,
+  "max_drawdown_cap_pct": 7.5,
+  "max_open": 2,
+  "max_per_strategy": 1,
+  "max_per_symbol": 1,
+  "setups": [
+    {
+      "id": "DERIV_EXTERNAL",
+      "symbol": "Range Break 100 Index",
+      "strategy": "External",
+      "enabled": false,
+      "entry_utc": [
+        "00:00",
+        "24:00"
+      ],
+      "max_trades_per_session": 2,
+      "profile": "external"
+    }
+  ],
+  "timezone": "UTC",
+  "bias": {
+    "completed_bars_only": true,
+    "require_agreement": {
+      "H4": 50,
+      "D1": 20
+    }
+  },
+  "signal_timeframes": {
+    "Session ORB": "M5",
+    "EMA VWAP": "M15"
+  },
+  "daily_loss_basis": "floating_equity_at_UTC_day_start",
+  "drawdown_basis": "floating_equity_high_water_mark",
+  "paper_mode": true,
+  "profile": "deriv_synthetics_mt5",
+  "max_dd_cap_pct": 7.5,
+  "execution_mode": "paper",
+  "news": {
+    "enabled": false
+  },
+  "risk_amount_usd": 5,
+  "daily_loss_cap_usd": 20,
+  "account_currency": "USD",
+  "always_open": true
+}

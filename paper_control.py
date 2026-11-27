@@ -60,6 +60,8 @@ class Settings(Payload):
     risk_pct:float|None=Field(default=None,gt=0,le=.75)
     daily_loss_cap_pct:float|None=Field(default=None,gt=0,le=2.5)
     max_dd_cap_pct:float|None=Field(default=None,gt=0,le=7.5)
+    risk_amount_usd:float|None=Field(default=None,gt=0)
+    daily_loss_cap_usd:float|None=Field(default=None,gt=0)
     setups:list[Toggle]=Field(default_factory=list)
 
 
@@ -83,6 +85,17 @@ def news_reason(calendar,now):
                 and abs(event["timestamp"]-now)<=900):
             return "High-impact "+event["currency"]+" news window"
     return None
+
+
+def calendar_pause(s,now):
+    policy=s["config"].get("news",{})
+    if not policy.get("enabled",True): return None
+    reason=news_reason(s["calendar"],now)
+    if reason=="Calendar coverage unavailable" and policy.get("offline_fallback")=="allow_paper":
+        # Even an incomplete cache may contain a known event in the guard interval.
+        events=(s["calendar"] or {}).get("events",[])
+        return news_reason(dict(start=now-901,end=now+901,events=events),now)
+    return reason
 
 
 def authorize(role):
@@ -156,7 +169,7 @@ def risk(s,now):
     dd=max(0.,100*(1-value/s["peak"]))
     if dd>=s["config"]["max_dd_cap_pct"]-1e-10:
         flatten(s,"MAX_DRAWDOWN",now)
-    elif daily>=s["config"]["daily_loss_cap_pct"]-1e-10 and not s["locked"]:
+    elif (s["day_open"]-value>=s["config"]["daily_loss_cap_usd"] if "daily_loss_cap_usd" in s["config"] else daily>=s["config"]["daily_loss_cap_pct"]-1e-10) and not s["locked"]:
         flatten(s,"DAILY_LOSS",now)
     return daily,dd
 
@@ -185,12 +198,20 @@ def quote(account:str,q:Quote,cfg=Depends(feed)):
                         (v["symbol"],v["strategy"])==(p["symbol"],p["strategy"]))
             clock=datetime.fromtimestamp(now,timezone.utc)
             opened=datetime.fromtimestamp(p["opened_at"],timezone.utc)
-            if clock.date()!=opened.date() or clock.strftime("%H:%M")>=window[1]:
+            if not s["config"].get("always_open") and (clock.date()!=opened.date() or clock.strftime("%H:%M")>=window[1] or now>=p.get("session_end",float("inf"))):
                 close(s,p,"SESSION_END",now)
                 continue
             buy=p["side"]=="BUY"
             if (q.bid<=p["stop"] if buy else q.ask>=p["stop"]): close(s,p,"STOP",now)
-            elif (q.bid>=p["target"] if buy else q.ask<=p["target"]): close(s,p,"TARGET",now)
+            elif p.get("exit_rule")=="partialtrail" and not p.get("partial") and (q.bid>=p["target"] if buy else q.ask<=p["target"]):
+                p["volume"]/=2
+                gain=pnl(s,p)
+                s["balance"]+=gain
+                s["history"].append(dict(**p,closed_at=now,net_pnl=gain,reason="PARTIAL_1R",mark_time=q.timestamp))
+                p["partial"]=True
+                p["partial_at"]=now
+            elif p.get("exit_rule") not in ("partialtrail","be") and (q.bid>=p["target"] if buy else q.ask<=p["target"]):
+                close(s,p,"TARGET",now)
         return {"equity":equity(s),"locked":s["locked"]}
 
 
@@ -205,35 +226,43 @@ def calendar(account:str,data:Calendar,cfg=Depends(feed)):
 def enter(account:str,intent:Intent,cfg=Depends(feed)):
     now=time.time()
     with state(account,cfg) as s:
-        rollover(s,now)
-        risk(s,now)
-        c=s["config"]; ps=s["positions"]
-        setup=next((v for v in c["setups"] if v["symbol"]==intent.symbol and v["strategy"]==intent.strategy),None)
-        clock=datetime.fromtimestamp(now,timezone.utc)
-        q=s["quotes"].get(intent.symbol)
-        reason=s["locked"] or news_reason(s["calendar"],now)
-        if not setup or not setup["enabled"]: reason="Setup disabled"
-        elif clock.weekday()>4 or not setup["entry_utc"][0]<=clock.strftime("%H:%M")<setup["entry_utc"][1]: reason="Outside setup session"
-        if not q or any(now-s["quotes"][sym]["timestamp"]>30 for sym in {intent.symbol}|{p["symbol"] for p in ps}): reason="Quote unavailable or stale"
-        if len(ps)>=c["max_open"] or any(p["symbol"]==intent.symbol or p["strategy"]==intent.strategy for p in ps): reason="Exposure limit"
-        if any(p["id"]==intent.id for p in ps+s["history"]): reason="Intent already processed"
-        session="NY" if clock.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")>="09:30" and intent.symbol=="XAUUSD" else "London"
-        key=json.dumps([intent.symbol,intent.strategy,session])
-        if setup and s["used"].get(key,0)>=setup["max_trades_per_session"]: reason="Session limit"
-        bias=s["bias"].get(intent.symbol,{})
-        if now-bias.get("as_of",0)>300 or bias.get("direction")!=("BULLISH" if intent.side=="BUY" else "BEARISH"): reason="Missing or conflicting market bias"
-        if reason: return {"command":"WAIT","reason":reason}
-        buy=intent.side=="BUY"; entry=q["ask" if buy else "bid"]
-        if not (intent.stop<q["bid"]<=entry<intent.target if buy else intent.target<entry<=q["ask"]<intent.stop):
-            return {"command":"WAIT","reason":"Invalid protective levels"}
-        budget=min(equity(s),s["balance"])*c["risk_pct"]/100
-        raw=min(q["volume_max"],budget/(abs(entry-intent.stop)*q["cash_per_price_unit"]))
-        if raw<q["volume_min"]: return {"command":"WAIT","reason":"Below minimum volume"}
-        volume=q["volume_min"]+math.floor((raw-q["volume_min"])/q["volume_step"])*q["volume_step"]
-        ps.append(dict(**intent.model_dump(),entry=entry,volume=volume,opened_at=now))
-        s["used"][key]=s["used"].get(key,0)+1
-        risk(s,now)
-        return {"paper_mode":True,"id":intent.id,"locked":s["locked"]}
+        return admit(s,intent,now)
+
+
+def admit(s,intent,now,rule=None):
+    rollover(s,now)
+    risk(s,now)
+    c=s["config"]; ps=s["positions"]
+    setup=next((v for v in c["setups"] if v["symbol"]==intent.symbol and v["strategy"]==intent.strategy),None)
+    clock=datetime.fromtimestamp(now,timezone.utc)
+    q=s["quotes"].get(intent.symbol)
+    reason=s["locked"] or calendar_pause(s,now)
+    if not setup or not setup["enabled"]: reason="Setup disabled"
+    elif not c.get("always_open") and (clock.weekday()>4 or not setup["entry_utc"][0]<=clock.strftime("%H:%M")<setup["entry_utc"][1]): reason="Outside setup session"
+    if not q or any(now-s["quotes"][sym]["timestamp"]>30 for sym in {intent.symbol}|{p["symbol"] for p in ps}): reason="Quote unavailable or stale"
+    if len(ps)>=c["max_open"] or any(p["symbol"]==intent.symbol or p["strategy"]==intent.strategy for p in ps): reason="Exposure limit"
+    if any(p["id"]==intent.id for p in ps+s["history"]): reason="Intent already processed"
+    session="NY" if clock.astimezone(ZoneInfo("America/New_York")).strftime("%H:%M")>="09:30" and intent.symbol=="XAUUSD" else "London"
+    key=json.dumps([intent.symbol,intent.strategy,session])
+    if setup and s["used"].get(key,0)>=setup["max_trades_per_session"]: reason="Session limit"
+    bias=s["bias"].get(intent.symbol,{})
+    if now-bias.get("as_of",0)>300 or bias.get("direction")!=("BULLISH" if intent.side=="BUY" else "BEARISH"): reason="Missing or conflicting market bias"
+    if reason: return {"command":"WAIT","reason":reason}
+    buy=intent.side=="BUY"; entry=q["ask" if buy else "bid"]
+    if not (intent.stop<q["bid"]<=entry<intent.target if buy else intent.target<entry<=q["ask"]<intent.stop):
+        return {"command":"WAIT","reason":"Invalid protective levels"}
+    budget=c.get("risk_amount_usd",min(equity(s),s["balance"])*c["risk_pct"]/100)
+    raw=min(q["volume_max"],budget/(abs(entry-intent.stop)*q["cash_per_price_unit"]))
+    if raw<q["volume_min"]: return {"command":"WAIT","reason":"Below minimum volume"}
+    volume=q["volume_min"]+math.floor((raw-q["volume_min"])/q["volume_step"])*q["volume_step"]
+    position=dict(**intent.model_dump(),entry=entry,volume=volume,opened_at=now,exit_rule=rule)
+    if intent.symbol=="XAUUSD" and session=="London":
+        position["session_end"]=clock.astimezone(ZoneInfo("America/New_York")).replace(hour=9,minute=30,second=0,microsecond=0).timestamp()
+    ps.append(position)
+    s.setdefault("alerts",[]).append(dict(position,setup_id=setup.get("id"),execution_mode=c.get("execution_mode","paper")))
+    s["used"][key]=s["used"].get(key,0)+1
+    risk(s,now)
+    return {"paper_mode":True,"id":intent.id,"locked":s["locked"]}
 
 
 @app.get("/accounts/{account}/status")
@@ -244,7 +273,7 @@ def status(account:str,cfg=Depends(control)):
         daily,dd=risk(s,now)
         return dict(paper_mode=True,profile=s["profile"],config=s["config"],balance=s["balance"],equity=equity(s),
                     floating_pnl=equity(s)-s["balance"],daily_loss_pct=daily,drawdown_pct=dd,locked=s["locked"],
-                    news_pause=news_reason(s["calendar"],now),positions=s["positions"],
+                    news_pause=calendar_pause(s,now),positions=s["positions"],
                     quote_times={k:v["timestamp"] for k,v in s["quotes"].items()})
 
 
@@ -258,6 +287,7 @@ def settings(account:str,patch:Settings,cfg=Depends(control)):
     with state(account,cfg) as s:
         rollover(s,time.time())
         for key,value in patch.model_dump(exclude_none=True,exclude={"setups"}).items():
+            if key.endswith("_usd") and key not in s["config"]: raise HTTPException(422,"Account does not use USD limits")
             s["config"][key]=value
             if key=="max_dd_cap_pct": s["config"]["max_drawdown_cap_pct"]=value
         for toggle in patch.setups:
@@ -275,6 +305,8 @@ def emergency(account:str,cfg=Depends(control)):
 
 
 class BiasBar(Payload):
+    open:float|None=Field(default=None,gt=0)
+    tick_volume:int|None=Field(default=None,ge=0)
     time:int=Field(gt=0)
     high:float=Field(gt=0)
     low:float=Field(gt=0)
@@ -287,6 +319,8 @@ class BiasBar(Payload):
 
 
 class HistoryBars(Payload):
+    M5:list[BiasBar]|None=Field(default=None,max_length=500)
+    H1:list[BiasBar]|None=Field(default=None,max_length=500)
     H4:list[BiasBar]=Field(min_length=50,max_length=500)
     D1:list[BiasBar]=Field(min_length=20,max_length=500)
     M15:list[BiasBar]=Field(min_length=1,max_length=500)
@@ -299,11 +333,42 @@ def update_bias(account:str,symbol:str,bars:HistoryBars,cfg=Depends(feed)):
     with state(account,cfg) as s:
         if symbol not in {v["symbol"] for v in s["config"]["setups"]}: raise HTTPException(422,"Unknown symbol")
     try:
-        snapshot=describe({k:pd.DataFrame(v) for k,v in bars.model_dump().items()},time.time())
+        frames={k:pd.DataFrame(v) for k,v in bars.model_dump(exclude_none=True).items()}
+        snapshot=describe(frames,time.time())
     except ValueError as exc:
         raise HTTPException(422,str(exc)) from exc
     snapshot["symbol"]=symbol
-    with state(account,cfg) as s: s["bias"][symbol]=snapshot
+    with state(account,cfg) as s:
+        now=time.time()
+        s["bias"][symbol]=snapshot
+        if {"H1","M5"}<=frames.keys() and not s["config"].get("always_open"):
+            from paper_signals import decisions
+            try:
+                candidates,last=decisions(frames,symbol,s["config"]["setups"],now)
+            except (ValueError,KeyError,TypeError) as exc:
+                raise HTTPException(422,"Invalid strategy bars") from exc
+            for p in s["positions"]:
+                if p["symbol"]!=symbol: continue
+                buy=p["side"]=="BUY"
+                if p.get("exit_rule")=="partialtrail" and p.get("partial") and "M15" in last:
+                    end,price,atr,_,_=last["M15"]
+                    if end>=p["partial_at"] and math.isfinite(atr):
+                        p["stop"]=max(p["stop"],price-2*atr) if buy else min(p["stop"],price+2*atr)
+                if p.get("exit_rule")=="be" and "M5" in last:
+                    end,_,_,high,low=last["M5"]
+                    if end-300>=int(p["opened_at"]//300)*300 and (high>=p["target"] if buy else low>=p["target"]):
+                        p["stop"]=p["entry"]
+            q=s["quotes"].get(symbol)
+            for setup,side,stop,end in candidates:
+                if not q: continue
+                rule=setup["profile"].split("/")[0]
+                rr={"partialtrail":1.,"be":1.,"2R":2.,"1.5R":1.5}[rule]
+                entry=q["ask"] if side==1 else q["bid"]
+                target=entry+rr*(entry-stop)
+                if target<=0: continue
+                intent=Intent(id=f"{symbol}/{setup['strategy']}/{end}",symbol=symbol,strategy=setup["strategy"],
+                              side="BUY" if side==1 else "SELL",stop=stop,target=target)
+                admit(s,intent,now,rule)
     note=commentary(snapshot)
     if note:
         with state(account,cfg) as s:
@@ -320,3 +385,28 @@ def market_bias(account:str,cfg=Depends(control)):
             if snapshot and time.time()-snapshot["as_of"]<=300: result[symbol]=snapshot
             else: result[symbol]=dict(direction="NEUTRAL",stale=True,ai=None)
         return result
+
+
+@app.get("/accounts/{account}/alerts")
+def alerts(account:str,cfg=Depends(control)):
+    with state(account,cfg) as s: return s.get("alerts",[])
+
+
+@app.post("/accounts/{account}/calendar/refresh")
+def refresh_calendar(account:str,cfg=Depends(feed)):
+    from paper_calendar import fetch_week
+    import requests
+    with state(account,cfg) as s:
+        if not s["config"].get("news",{}).get("enabled",True): return {"status":"disabled"}
+    try:
+        data=fetch_week(time.time())
+    except (requests.RequestException,ValueError,TypeError,KeyError):
+        return {"status":"cached_or_offline"}
+    with state(account,cfg) as s: s["calendar"]=data
+    return {"status":"refreshed"}
+
+@app.get("/accounts/{account}/feed-config")
+def feed_config(account:str,cfg=Depends(feed)):
+    with state(account,cfg) as s:
+        c=s["config"]
+        return {"symbols":sorted({v["symbol"] for v in c["setups"]}),"currency":c.get("account_currency")}

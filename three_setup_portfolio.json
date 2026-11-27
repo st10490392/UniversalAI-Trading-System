@@ -21,7 +21,8 @@
         "1.5R/15m"
       ],
       "profile": "1.5R/15m",
-      "max_trades_per_session": 1
+      "max_trades_per_session": 1,
+      "id": "XAUUSD_ORB"
     },
     {
       "symbol": "XAUUSD",
@@ -36,7 +37,8 @@
         "partialtrail"
       ],
       "profile": "partialtrail",
-      "max_trades_per_session": 1
+      "max_trades_per_session": 1,
+      "id": "XAUUSD_EMA_VWAP"
     },
     {
       "symbol": "Germany 40",
@@ -51,7 +53,8 @@
         "2R"
       ],
       "profile": "2R",
-      "max_trades_per_session": 1
+      "max_trades_per_session": 1,
+      "id": "GER40_EMA_VWAP"
     }
   ],
   "timezone": "UTC",
@@ -70,5 +73,10 @@
   "drawdown_basis": "floating_equity_high_water_mark",
   "paper_mode": true,
   "profile": "prop_firm_core",
-  "max_dd_cap_pct": 7.5
+  "max_dd_cap_pct": 7.5,
+  "execution_mode": "paper",
+  "news": {
+    "enabled": true,
+    "offline_fallback": "block"
+  }
 }

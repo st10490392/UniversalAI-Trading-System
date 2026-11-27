@@ -149,6 +149,34 @@ Use separate terminal instances for different broker logins. The bridge checks t
 | Feed | POST /accounts/{account}/paper-intents | Submit an upstream strategy-confirmed id, symbol, strategy, side, stop and target |
 | Feed | POST /accounts/{account}/quotes or /accounts/{account}/bars/{symbol} | Publish verified broker quote/specification or closed market history |
 
-Send `Authorization: Bearer <account-role-token>`. Calendar coverage must include the entire ±15-minute guard interval, even on days without events. The deployment must supply the economic-calendar source and strategy-confirmed intents. The core enforces bias, sessions, size, caps, duplicate protection and protective exits. Strategy-specific partial exits/trailing and broker-specific fees are not modeled by the paper fill adapter.
+Send `Authorization: Bearer <account-role-token>`. Mobile clients can also poll `GET /accounts/{account}/alerts` for accepted signals, setup IDs, entry, stop, first milestone/target and shadow size. Read history for partial exits and status for the current stop.
 
-Daily loss uses the account's first UTC-day opening equity reference, carried from its last known marks. Total drawdown uses peak marked equity. New quotes synchronously mark positions and check both limits. An outage prevents fresh valuation and stale required quotes block entries. Flattening uses last-known marks and records their timestamps. Daily locks clear on the next UTC day; emergency and total-drawdown locks persist. Default caps are 2.5% daily and 7.5% total.
+### Strategy runner
+
+Use the API and bridge commands above. The bridge discovers symbols via authenticated `GET /accounts/{account}/feed-config`. Each M5 boundary sends closed M5/M15/H1/H4/D1 history to the bars endpoint. H1 supplies ATR and EMA context, H4/D1 alignment gates entries. Only the latest signal close within 30 seconds is eligible. Missed entries are skipped on reconnect. Stable setup/bar IDs deduplicate fills.
+
+| Setup | Active rule |
+|---|---|
+| XAUUSD_ORB | 15-minute range, M5 close confirmation, midpoint stop and 1.5R target. The earlier fold profile `be/30m` uses a 30-minute range and moves to breakeven after a completed M5 reaches 1R. |
+| XAUUSD_EMA_VWAP | M15 session VWAP and EMA pullback with H1 EMA-200. Realize half at the first liquidation quote crossing 1R and trail the rest two ATRs from completed M15 closes. |
+| GER40_EMA_VWAP | Same pullback detector, fixed 2R target. |
+
+Gold London starts at 07:00 UTC and hands off to NY at 09:30 ET. Gold NY ends at 17:00 UTC. Germany 40 runs 07:00-15:30 UTC. The first available liquidation quote after the session ends closes its paper positions. Paper results use observed quotes, exclude broker fees and can differ from the bar replay.
+
+### Isolated profiles
+
+Set each account record's `profile` and `config` fields in `PAPER_ACCOUNTS_JSON`, using separate control/feed tokens and terminal connections. Start the server from the repository root for relative template paths.
+
+| Profile | Template | Behavior |
+|---|---|---|
+| prop_firm_core | three_setup_portfolio.json | Automatic three-setup paper book |
+| prop_firm_matchtrader | config/prop_firm_matchtrader.json | Signal-only MatchTrader alerts, market bias and shadow equity. Manual broker fills are tracked separately by the trader. |
+| deriv_synthetics_mt5 | config/deriv_synthetics_mt5.json | USD terminal, 24/7 eligibility, fixed-dollar risk and daily loss lock, news disabled. The sample external synthetic setup starts disabled. |
+
+For Deriv, enable the desired setup via PATCH settings and submit strategy-confirmed intents via the feed endpoint. `risk_amount_usd` and `daily_loss_cap_usd` are hot-reloadable on dollar-risk profiles. The bridge checks terminal currency. All templates use `paper_mode: true`; the MT5 connector receives market data and the execution ledger simulates fills. No live order switch is exposed.
+
+### Calendar and risk
+
+The bridge calls `POST /accounts/{account}/calendar/refresh` at startup and every 15 minutes. The API fetches Forex Factory weekly JSON, validates its week, and caches events in the account database. High-impact USD/EUR news blocks entries through both 15-minute boundaries. Fetch failure preserves the cache. Set `news.offline_fallback` to `block` (default) or `allow_paper` for offline testing. Known events still block in fallback mode. A feed client can also POST its own covered calendar.
+
+Daily limits use UTC day-opening marked equity. Total drawdown uses peak marked equity. New quotes synchronously update positions and enforce liquidation/locks. Daily locks reset on the next UTC day. Emergency and total-drawdown locks persist.
