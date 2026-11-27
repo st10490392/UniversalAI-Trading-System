@@ -126,7 +126,7 @@ def simulate(a,signal,end,mode,stress):
         if mode=="partialtrail" and remaining==.5 and np.isfinite(a.atr14[k]):
             stop=s*max(s*stop,s*(a.close[k]+adj)-2*a.atr14[k])
     commission=(10.5 if stress else 7)*a.tick_size[j]/a.tick_value[j] if a.tick_value[j]>0 and a.tick_size[j]>0 else (1.5 if stress else 1)*point
-    return k,{"time":a.time[j].isoformat(),"r":result-commission/risk}
+    return k,{"time":a.time[j].isoformat(),"exit":(a.time[k]+pd.Timedelta(minutes=a.minutes)).isoformat(),"r":result-commission/risk}
 
 
 def completed_m15(d):
@@ -139,13 +139,28 @@ def completed_m15(d):
     return features(add_indicators(bars))
 
 
-def evaluate(symbol,path,minutes=15):
+MAJORS={"EURUSD","GBPUSD","USDJPY"}
+
+
+def higher_bias(d):
+    states=[]
+    decision_times=pd.DatetimeIndex(d.time)+pd.Timedelta(minutes=5)
+    for interval,span in (("4h",50),("1D",20)):
+        close=d.set_index("time").close.resample(interval,closed="left",label="right").last().dropna()
+        ema=close.ewm(span=span,min_periods=span,adjust=False).mean()
+        states.append(np.sign(close-ema).reindex(decision_times,method="ffill").fillna(0).to_numpy())
+    return np.where(states[0]==states[1],states[0],0)
+
+
+def evaluate(symbol,path,minutes=15,experiment=False,ledger=None):
     from types import SimpleNamespace
     d,spreads,valid=prepare(path)
     d=features(d,minutes)
     higher=completed_m15(d) if minutes==5 else d
     d["spread_points"]=spreads
     a=SimpleNamespace(**{c:d[c].to_numpy() for c in ("open","close","high","low","spread_points","point_size","tick_size","tick_value","atr14")},time=d.time.array)
+    a.minutes=minutes
+    bias=higher_bias(d) if experiment else None
     trailing=SimpleNamespace(**vars(a))
     trailing.atr14=higher.atr14.reindex(d.index).to_numpy()
     days=list(d.groupby(d.time.dt.date).indices.items())
@@ -163,7 +178,20 @@ def evaluate(symbol,path,minutes=15):
         minute=(daily.time.dt.hour*60+daily.time.dt.minute)
         levels=[] if previous is None else [previous]
         router=[]
-        for label,start,end in (("Asia",0,360),("London",480,ny),("NY",ny,ny+390),("Gold",780,1260)):
+        windows=[("Asia",0,360),("London",480,ny),("NY",ny,ny+390),("Gold",780,1260)]
+        if experiment:
+            if symbol in ("Wall Street 30","US Tech 100"):
+                windows=[("NY",870,1230)]
+            elif symbol=="Germany 40":
+                windows=[("London",420,930)]
+            else:
+                windows=[("London",420,ny),("NY",ny,1020)]
+                if symbol in MAJORS:
+                    windows.insert(0,("Asia",0,360))
+            if symbol not in MAJORS:
+                asia=daily[minute<360]
+                if len(asia)==72: levels.append((asia.high.max(),asia.low.min()))
+        for label,start,end in windows:
             g=daily[(minute>=start)&(minute<end)]
             if len(g)<2: continue
             execution=higher.loc[g.index[0]:g.index[-1]] if minutes==5 else g
@@ -173,7 +201,7 @@ def evaluate(symbol,path,minutes=15):
                 sig=[(i,int(gold_side[i]),gold_stop[i],np.nan,np.nan) for i in g.index if gold_side[i] and minute[i]<945]
                 specs.append(("Gold baseline","3R",1,sig))
             elif label=="Asia":
-                for flatness in ((.25,.50) if minutes==5 else (.25,)):
+                for flatness in ((.50,) if experiment else (.25,.50) if minutes==5 else (.25,)):
                     flat=execution.flat if flatness==.25 else execution.flat_loose
                     sig=asian(execution.assign(flat=flat))
                     specs.extend(("Asian MR",mode+(f"/{flatness:.2f}" if minutes==5 else ""),1,sig) for mode in ("bands","mid1.5"))
@@ -187,6 +215,8 @@ def evaluate(symbol,path,minutes=15):
                 sig=sorted(set(item for level in levels for item in sweep(g,*level)))
                 specs.extend(("Sweep MSS",mode,1,sig) for mode in ("2R","3R","liquidity"))
             for family,profile,cap,signals in specs:
+                if experiment and family!="Asian MR":
+                    signals=[sig for sig in signals if sig[1]==bias[sig[0]]]
                 key=(family,profile,cap)
                 mode=profile.split("/")[0]
                 for stress in (False,True):
@@ -197,10 +227,11 @@ def evaluate(symbol,path,minutes=15):
                         trade=simulate(trailing if minutes==5 and mode=="partialtrail" else a,signal,g.index[-1],mode,stress)
                         if trade is None: continue
                         k,t=trade
+                        t["session"]=label
                         streams[key,phase,stress].append(t)
                         busy=k;count+=1
                         if count>=cap: break
-                if (family,profile,cap) in (("Session ORB","2R/30m",1),("EMA VWAP","2R",1),("Asian MR","bands/0.25" if minutes==5 else "bands",1),("Sweep MSS","2R",1)):
+                if (family,profile,cap) in (("Session ORB","2R/30m",1),("EMA VWAP","2R",1),("Asian MR","bands/0.50" if experiment else "bands/0.25" if minutes==5 else "bands",1),("Sweep MSS","2R",1)):
                     for sig in signals:
                         i=sig[0]
                         if i>=g.index[-1] or not valid[i] or not valid[i+1] or (a.time[i+1]-a.time[i]).total_seconds()!=minutes*60: continue
@@ -216,6 +247,7 @@ def evaluate(symbol,path,minutes=15):
                 trade=simulate(trailing if minutes==5 and mode=="partialtrail" else a,sig,end,mode,stress)
                 if trade:
                     busy,t=trade
+                    t["session"]=label
                     streams[("Router","fixed",1),phase,stress].append(t)
                     used.add((family,label))
     keys={k for k,_,_ in streams}
@@ -224,6 +256,8 @@ def evaluate(symbol,path,minutes=15):
     if minutes==5:
         keys.difference_update({("Asian MR","bands",1),("Asian MR","mid1.5",1)})
         keys.update(("Asian MR",f"{mode}/{threshold}",1) for mode in ("bands","mid1.5") for threshold in ("0.25","0.50"))
+    if experiment:
+        keys={k for k in keys if k[0]!="Asian MR" or (symbol in MAJORS and "0.50" in k[1])}
     def stats(trades):
         return standard_trade_stats(trades)
     def row(f,p,fold,b,s):
@@ -240,6 +274,10 @@ def evaluate(symbol,path,minutes=15):
                 x=stats(streams[k,fold-1,True])
                 return (x["trades"]>=10,x["average_r"] if x["trades"] else -np.inf)
             pick=max(group,key=rank)
+            if ledger is not None:
+                for stress in (False,True):
+                    ledger.extend(dict(t,symbol=symbol,strategy=family,fold=fold,stress=stress)
+                                  for t in streams[pick,fold,stress])
             for stress in (False,True): pool[stress].extend(streams[pick,fold,stress])
             rows.append(row(family,"selected "+str(pick[1:]),fold,streams[pick,fold,False],streams[pick,fold,True]))
         rows.append(row(family,"selected","pooled",*pool))
