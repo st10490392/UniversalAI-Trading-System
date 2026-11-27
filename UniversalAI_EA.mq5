@@ -10,6 +10,7 @@ input string LicenseKey="";
 input int PollSeconds=2;
 input long MagicNumber=20261125;
 input int SlippagePoints=20;
+input bool DemoXauNyBreakout=false;   // opt-in, XAUUSD on MT5 demo only
 input bool DemoRollingORB=false;       // opt-in, Range Break 100 Index on MT5 demo only
 input int MaxSignalAgeSeconds=1800;   // reject signals whose M15 bar is older than this (server time)
 
@@ -79,7 +80,7 @@ void CloseMagicPositions()
    {
       ulong ticket=PositionGetTicket(i);if(ticket==0)continue;
       if(PositionGetInteger(POSITION_MAGIC)==MagicNumber &&
-         (!DemoRollingORB || PositionGetString(POSITION_SYMBOL)==_Symbol))
+         (!(DemoRollingORB || DemoXauNyBreakout) || PositionGetString(POSITION_SYMBOL)==_Symbol))
          trade.PositionClose(ticket);
    }
 }
@@ -223,6 +224,8 @@ void ManageBreakeven()
 
 bool DemoOrbAccountAllowed()
 {
+   if(DemoXauNyBreakout)
+      return !DemoRollingORB && AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO && _Symbol=="XAUUSD";
    return !DemoRollingORB ||
           (AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO && _Symbol=="Range Break 100 Index");
 }
@@ -230,6 +233,11 @@ bool DemoOrbAccountAllowed()
 bool SignalProfileAllowed(const string json)
 {
    string profile=JsonString(json,"execution_profile");
+   if(DemoXauNyBreakout)
+   {
+      double risk=JsonNumber(json,"risk_pct",0.0);
+      return DemoOrbAccountAllowed() && profile=="demo_xau_ny_breakout" && risk>=0.25 && risk<=0.50;
+   }
    if(!DemoRollingORB)return profile=="";
    return DemoOrbAccountAllowed() && profile=="demo_rolling_orb" && JsonNumber(json,"risk_pct",0.0)==0.25;
 }
@@ -240,6 +248,7 @@ bool SendPoll(string &response)
    long login=AccountInfoInteger(ACCOUNT_LOGIN);
    string safe_symbol=_Symbol;StringReplace(safe_symbol,"%","%25");StringReplace(safe_symbol," ","%20");StringReplace(safe_symbol,"#","%23");
    string url=ServerURL+"/api/ea/poll/"+(string)login+"/"+safe_symbol;
+   if(DemoXauNyBreakout)url+="?demo_xau_ny_breakout=true";
    if(DemoRollingORB)url+="?demo_orb_profile=true";
    char data[],result[];
    string request_headers="X-License-Key: "+LicenseKey+"\r\n"+
@@ -290,7 +299,7 @@ void ExecuteSignal(const string json)
    if(decision!="BUY" && decision!="SELL")return;
    double bar=JsonNumber(json,"bar_time",0.0);
    if(sid=="" || AlreadyHandled(sid,bar))return;
-   if(bar<=0.0 || (double)TimeCurrent()-bar<900 || (double)TimeCurrent()-bar>=MathMin(MaxSignalAgeSeconds,1800)){Print("Stale signal skipped ",sid);RememberSignal(sid,bar);return;}
+   if(bar<=0.0 || (double)(DemoXauNyBreakout?TimeGMT():TimeCurrent())-bar<900 || (double)(DemoXauNyBreakout?TimeGMT():TimeCurrent())-bar>=MathMin(MaxSignalAgeSeconds,1800)){Print("Stale signal skipped ",sid);RememberSignal(sid,bar);return;}
    if(HasOpenPosition()){Print("Position already open on ",_Symbol,"; skipped ",sid);RememberSignal(sid,bar);return;}
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) || SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE)!=SYMBOL_TRADE_MODE_FULL)return;
    double sl=JsonNumber(json,"sl",0),tp=JsonNumber(json,"tp",0);
@@ -302,7 +311,7 @@ void ExecuteSignal(const string json)
    double risk_distance=MathAbs(entry-sl),reward_distance=MathAbs(tp-entry);
    bool valid=(decision=="BUY")?(sl<entry && tp>entry):(tp<entry && sl>entry);
    double min_stop=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
-   if(sl<=0 || tp<=0 || !MathIsValidNumber(sl) || !MathIsValidNumber(tp) || !valid || risk_distance<min_stop || reward_distance<min_stop || reward_distance/risk_distance<2.5)
+   if(sl<=0 || tp<=0 || !MathIsValidNumber(sl) || !MathIsValidNumber(tp) || !valid || risk_distance<min_stop || reward_distance<min_stop || reward_distance/risk_distance<(DemoXauNyBreakout?3.0-1e-9:2.5))
    { Print("Signal became invalid at market price; skipped ",sid);RememberSignal(sid,bar);return; }
    ENUM_ORDER_TYPE type=(decision=="BUY"?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
    double used=0.0,lots=RiskLots(type,entry,sl,used);
@@ -313,6 +322,18 @@ void ExecuteSignal(const string json)
    if(dnow+used>=max_daily_dd_pct || tnow+used>=max_total_dd_pct){Print("DD headroom too small for risk ",DoubleToString(used,2),"%; skipped ",sid);RememberSignal(sid,bar);return;}
    trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);trade.SetTypeFillingBySymbol(_Symbol);
    if(!DemoOrbAccountAllowed())return;
+   if(DemoXauNyBreakout)
+   {
+      datetime utc=TimeGMT();
+      MqlDateTime clock;TimeToStruct(utc,clock);
+      if(clock.day_of_week==0 || clock.day_of_week==6 || clock.hour<13 || clock.hour>=16 ||
+         utc-bar<900 || utc-bar>=1800)return;
+      string session_key="UAI_XAU_NY_"+(string)AccountInfoInteger(ACCOUNT_LOGIN);
+      if(!GlobalVariableCheck(session_key))return;
+      double previous=GlobalVariableGet(session_key), session=MathFloor((double)utc/86400.0);
+      if(previous>=session || !GlobalVariableSetOnCondition(session_key,session,previous))return;
+      GlobalVariablesFlush();
+   }
    RememberSignal(sid,bar);   // at-most-once: persist BEFORE sending so a timeout/crash cannot re-fire the same signal
    bool ok=(decision=="BUY")?trade.Buy(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid):trade.Sell(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid);
    if(ok)
@@ -353,6 +374,11 @@ void Poll()
 int OnInit()
 {
    if(PollSeconds<1 || !DemoOrbAccountAllowed())return INIT_PARAMETERS_INCORRECT;
+   if(DemoXauNyBreakout && DemoOrbAccountAllowed())
+   {
+      string key="UAI_XAU_NY_"+(string)AccountInfoInteger(ACCOUNT_LOGIN);
+      if(!GlobalVariableCheck(key))GlobalVariableSet(key,0.0);
+   }
    trade.SetExpertMagicNumber(MagicNumber);trade.SetTypeFillingBySymbol(_Symbol);current_server_day=DayStart(TimeCurrent());
    LoadState(AccountInfoDouble(ACCOUNT_EQUITY));
    circuit_open=daily_lock||total_lock;
@@ -365,6 +391,19 @@ void OnDeinit(const int reason){if(DemoOrbAccountAllowed())PersistIfNeeded(true)
 void OnTick(){if(!DemoOrbAccountAllowed())return;CheckCircuit();ManageBreakeven();}
 void OnTimer()
 {
+   if(DemoXauNyBreakout && DemoOrbAccountAllowed())
+   {
+      MqlDateTime utc;TimeToStruct(TimeGMT(),utc);
+      if(utc.hour>=21 || utc.hour<13)
+         for(int i=PositionsTotal()-1;i>=0;i--)
+         {
+            ulong ticket=PositionGetTicket(i);
+            if(ticket!=0 && PositionGetString(POSITION_SYMBOL)==_Symbol &&
+               PositionGetInteger(POSITION_MAGIC)==MagicNumber &&
+               StringFind(PositionGetString(POSITION_COMMENT),"UniversalAI XAUUSD-")==0)
+               trade.PositionClose(ticket);
+         }
+   }
    if(!DemoOrbAccountAllowed())return;
    CheckCircuit();
    Poll();

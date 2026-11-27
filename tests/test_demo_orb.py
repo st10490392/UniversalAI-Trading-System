@@ -134,3 +134,30 @@ def test_ea_poll_requires_explicit_demo_profile(monkeypatch):
         assert normal.call_count == 1
         assert wait["reason"] == "Offline" and wait["risk_pct"] == .25
         assert wait["sl"] == wait["tp"] == wait["confidence"] == 0.
+
+def test_gold_demo_route_is_opt_in_and_rejects_non_demo(monkeypatch):
+    import sys
+    import brain
+
+    mt5, account, info = broker()
+    monkeypatch.setitem(sys.modules, "MetaTrader5", mt5)
+    profile = {"broker_server":"Test-Demo","account_type":"broker","risk_pct":.50}
+    monkeypatch.delenv("ENABLE_DEMO_XAU_NY_BREAKOUT", raising=False)
+    assert brain.evaluate_demo_gold("42","XAUUSD",profile)["command"] == "WAIT"
+    mt5.initialize.assert_not_called()
+    monkeypatch.setenv("ENABLE_DEMO_XAU_NY_BREAKOUT","1")
+    account.trade_mode=2
+    result=brain.evaluate_demo_gold("42","XAUUSD",profile)
+    assert result["command"]=="WAIT"
+    assert result["sl"]==result["tp"]==result["confidence"]==0.
+    mt5.copy_rates_from_pos.assert_not_called()
+    mt5.order_send.assert_not_called()
+    account.trade_mode=0
+    info.name="XAUUSD"
+    monkeypatch.setattr(brain.gold,"broker_context", lambda *args: {
+        "symbol":"XAUUSD","side":"BUY","strategy":"XAUUSD NY 4-bar breakout",
+        "bar_time":1700000000,"setup":{"entry_reference":100.,"stop":96.,"target":112.}})
+    signal=brain.evaluate_demo_gold("42","XAUUSD",profile)
+    assert signal["command"]=="BUY" and signal["execution_profile"]==brain.gold.PROFILE
+    assert signal["demo_preflight_lots"]==2.5
+    mt5.order_send.assert_not_called()

@@ -21,6 +21,7 @@ from dotenv import load_dotenv
 from research_lab import STRATEGIES as RESEARCH_STRATEGIES, live_candidates
 from strategies import SIGNAL_SCHEMA, _make_wait, validate_signal
 import demo_orb
+import xau_ny_breakout as gold
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
@@ -579,8 +580,42 @@ def evaluate_demo_orb(account_id:str,symbol:str,account:Any)->dict[str,Any]:
     return result
 
 
+def evaluate_demo_gold(account_id, symbol, account):
+    if os.getenv("ENABLE_DEMO_XAU_NY_BREAKOUT") != "1" or symbol != gold.SYMBOL:
+        return _wait_signal("Demo XAUUSD breakout is disabled or symbol is unsupported")
+    risk = account["risk_pct"]
+    if account["account_type"] != "broker" or not .25 <= risk <= .50:
+        return _wait_signal("Demo XAUUSD requires a broker profile with 0.25%-0.50% risk")
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        return _wait_signal("MT5 integration is unavailable")
+    path = os.getenv("DEMO_MT5_TERMINAL_PATH")
+    if not (mt5.initialize(path) if path else mt5.initialize()):
+        return _wait_signal("Cannot connect to MT5 demo for XAUUSD preflight")
+    try:
+        connected, info, tick = demo_orb.demo_broker_snapshot(mt5, account_id, account["broker_server"], symbol)
+        rates = mt5.copy_rates_from_pos(symbol, mt5.TIMEFRAME_M15, 1, 500)
+        context = gold.broker_context(rates, info, tick, time.time())
+        lots = demo_orb.check_demo_volume(mt5, connected, info, context, risk)
+    except demo_orb.DemoUnavailable as exc:
+        return _wait_signal(str(exc))
+    finally:
+        mt5.shutdown()
+    setup = context["setup"]
+    side, entry = context["side"], setup["entry_reference"]
+    signal = validate_signal(dict(command=side, sl=setup["stop"], tp=setup["target"],
+                                  confidence=1., setup=context["strategy"], reason="Completed deterministic breakout"))
+    if not _valid_signal_risk(signal, entry, side):
+        return _wait_signal("XAUUSD breakout failed signal risk validation")
+    bar = context["bar_time"]
+    return {**signal, "decision":side, "entry":entry, "symbol":symbol, "bar_time":bar,
+            "signal_id":f"XAUUSD-{bar//86400}-demo-ny", "execution_profile":gold.PROFILE,
+            "demo_preflight_lots":lots}
+
+
 @app.get("/api/ea/poll/{account_id}/{symbol}")
-def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default=""),x_device_id:str=Header(default=""),demo_orb_profile:bool=False):
+def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default=""),x_device_id:str=Header(default=""),demo_orb_profile:bool=False,demo_xau_ny_breakout:bool=False):
     init_db()
     if not _ea_authorized(x_license_key,account_id,x_device_id):return {"command":"UNAUTHORIZED"}
     with _connect() as c:
@@ -590,7 +625,10 @@ def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Ac
     if not a["active"]:return {**_wait_signal("Account stopped"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     with _scanner_lock:
         try:
-            result=evaluate_demo_orb(account_id,symbol,a) if demo_orb_profile else analyze_symbol(symbol,account_id)
+            if demo_xau_ny_breakout:
+                result = _wait_signal("Conflicting demo profiles") if demo_orb_profile else evaluate_demo_gold(account_id,symbol,a)
+            else:
+                result=evaluate_demo_orb(account_id,symbol,a) if demo_orb_profile else analyze_symbol(symbol,account_id)
         except Exception:LOG.exception("analyze_symbol failed for %s",symbol);result=None
     if not result or result["decision"] not in ("BUY","SELL"):return {**_wait_signal(result["reason"] if result else "No qualified setup"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     result=dict(result)  # never mutate the per-symbol cache shared across accounts/threads

@@ -14,6 +14,7 @@ import pandas as pd
 from fx_stocks_all_strategies import adx14, prepare, regular_signals, signed, train_model
 from fx_stocks_session_orb import EQUITIES, inventory
 from research_lab import ROOT, _trade_one, build_signals, standard_trade_stats
+from xau_ny_breakout import breakout
 from walkforward_standard import Variant, execution_columns, signal_components, stop_levels
 
 OUT = ROOT / "data/research_2020_2025/strategy_audit_variants"
@@ -136,9 +137,7 @@ def raw_families(data, spreads, valid):
         rsi_side=signed((l.shift(1)<=ema20.shift(1))&(c>ema20)&(c>o)&(data.rsi.shift(1)<=long_rsi)&(data.rsi>long_rsi)&(trend>0)&activity,
                         (h.shift(1)>=ema20.shift(1))&(c<ema20)&(c<o)&(data.rsi.shift(1)>=short_rsi)&(data.rsi<short_rsi)&(trend<0)&activity)
         result["ema_rsi_pullback"][label]=(rsi_side,np.where(rsi_side>0,l.shift(1)-spread,h.shift(1)+spread))
-    side=signed((c>h.shift().rolling(4).max())&(c>ema)&(trend>0)&(data.atr_ratio>1.05),
-                (c<l.shift().rolling(4).min())&(c<ema)&(trend<0)&(data.atr_ratio>1.05))
-    result["intraday_range_break"]={"4_bar_close":(side,c.to_numpy()-side*data.atr14)}
+    result["intraday_range_break"]={"4_bar_close":breakout(data)}
     side=signed((c>h.shift().rolling(8).max())&(c>ema)&(trend>0)&(data.atr_ratio>1.05),
                 (c<l.shift().rolling(8).min())&(c<ema)&(trend<0)&(data.atr_ratio>1.05))
     result["intraday_range_break"]["8_bar_close"]=(side,c.to_numpy()-side*data.atr14)

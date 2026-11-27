@@ -23,7 +23,7 @@ def _positive(*values):
     return all(isinstance(v, (int, float)) and not isinstance(v, bool) and isfinite(v) and v > 0 for v in values)
 
 
-def demo_broker_snapshot(mt5, account_id, server):
+def demo_broker_snapshot(mt5, account_id, server, symbol=SYMBOL):
     """Verify the connected terminal against the licensed, configured account."""
     terminal = mt5.terminal_info()
     account = mt5.account_info()
@@ -32,29 +32,29 @@ def demo_broker_snapshot(mt5, account_id, server):
     if (account.trade_mode != mt5.ACCOUNT_TRADE_MODE_DEMO or str(account.login) != account_id
             or account.server != server):
         raise DemoUnavailable("Connected MT5 account must match the configured demo login and server")
-    info = mt5.symbol_info(SYMBOL)
-    if info is None or info.name != SYMBOL:
-        raise DemoUnavailable("Range Break 100 Index is unavailable on the connected broker")
+    info = mt5.symbol_info(symbol)
+    if info is None or info.name != symbol:
+        raise DemoUnavailable(f"{symbol} is unavailable on the connected broker")
     if info.trade_mode != getattr(mt5, "SYMBOL_TRADE_MODE_FULL", 4):
-        raise DemoUnavailable("Range Break 100 Index is restricted on this account")
+        raise DemoUnavailable(f"{symbol} is restricted on this account")
     if not _positive(info.point, info.trade_tick_size, info.trade_contract_size,
                      info.volume_min, info.volume_max, info.volume_step) or info.volume_max < info.volume_min:
         raise DemoUnavailable("Broker contract, point, tick size or volume specification is invalid")
-    tick = mt5.symbol_info_tick(SYMBOL)
+    tick = mt5.symbol_info_tick(symbol)
     if tick is None or not _positive(tick.bid, tick.ask) or tick.ask < tick.bid:
         raise DemoUnavailable("Broker bid/ask is unavailable or invalid")
     return account, info, tick
 
 
-def demo_lots(capital, loss_per_lot, minimum, maximum, step):
+def demo_lots(capital, loss_per_lot, minimum, maximum, step, risk_pct=RISK_PCT):
     """Round down on the broker's minimum-anchored volume grid."""
-    if not _positive(capital, loss_per_lot, minimum, maximum, step) or maximum < minimum:
+    if not _positive(capital, loss_per_lot, minimum, maximum, step, risk_pct) or maximum < minimum:
         raise DemoUnavailable("Cannot calculate demo risk lots from broker data")
-    budget = Decimal(str(capital)) * Decimal(str(RISK_PCT)) / 100
+    budget = Decimal(str(capital)) * Decimal(str(risk_pct)) / 100
     affordable = min(Decimal(str(maximum)), budget / Decimal(str(loss_per_lot)))
     floor, increment = Decimal(str(minimum)), Decimal(str(step))
     if affordable < floor:
-        raise DemoUnavailable("Broker minimum lot would exceed 0.25% demo risk")
+        raise DemoUnavailable(f"Broker minimum lot would exceed {risk_pct:g}% demo risk")
     return float(floor + ((affordable - floor) / increment).to_integral_value(rounding=ROUND_FLOOR) * increment)
 
 
@@ -100,13 +100,13 @@ def rolling_orb_context(bars, info, tick):
     }
 
 
-def check_demo_volume(mt5, account, info, context):
+def check_demo_volume(mt5, account, info, context, risk_pct=RISK_PCT):
     setup = context["setup"]
     action = mt5.ORDER_TYPE_BUY if context["side"] == "BUY" else mt5.ORDER_TYPE_SELL
-    loss = mt5.order_calc_profit(action, SYMBOL, info.volume_min, setup["entry_reference"], setup["stop"])
+    loss = mt5.order_calc_profit(action, context.get("symbol", SYMBOL), info.volume_min, setup["entry_reference"], setup["stop"])
     if loss is None or not _positive(-loss):
         raise DemoUnavailable("MT5 cannot calculate account-currency stop loss for this symbol")
     if not _positive(account.balance, account.equity):
         raise DemoUnavailable("Demo balance or equity is unavailable")
     return demo_lots(min(account.balance, account.equity), -loss/info.volume_min,
-                     info.volume_min, info.volume_max, info.volume_step)
+                     info.volume_min, info.volume_max, info.volume_step, risk_pct)
