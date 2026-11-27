@@ -72,6 +72,7 @@
   "daily_loss_basis": "floating_equity_at_UTC_day_start",
   "drawdown_basis": "floating_equity_high_water_mark",
   "paper_mode": true,
+  "ai_gate_enforce": false,
   "profile": "prop_firm_core",
   "max_dd_cap_pct": 7.5,
   "execution_mode": "paper",

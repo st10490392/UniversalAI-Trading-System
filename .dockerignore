@@ -1,0 +1,7 @@
+*
+!requirements.txt
+!*.py
+!three_setup_portfolio.json
+!config/
+!config/*.json
+!Dockerfile

@@ -12,20 +12,29 @@ from pathlib import Path
 
 def main():
     import MetaTrader5 as mt5
+    load_dotenv(Path(__file__).with_name(".bridge.env"))
     load_dotenv(Path(__file__).with_name(".env"))
     p=argparse.ArgumentParser(description=__doc__)
-    for key in ("account","terminal","server","login","feed-token-env"):
-        p.add_argument("--"+key,required=True)
-    p.add_argument("--url",default="http://127.0.0.1:8010")
+    for key,var in (("account","BRIDGE_ACCOUNT"),("terminal","MT5_TERMINAL_PATH"),("server","MT5_SERVER"),("login","MT5_LOGIN")):
+        p.add_argument("--"+key,default=os.getenv(var),required=not os.getenv(var))
+    p.add_argument("--feed-token-env",default="BRIDGE_SECRET")
+    p.add_argument("--url",default=os.getenv("BACKEND_URL","http://127.0.0.1:8010"))
     p.add_argument("--symbols",nargs="+",default=None)
     args=p.parse_args()
-    headers={"Authorization":"Bearer "+os.environ[args.feed_token_env]}
+    from urllib.parse import urlsplit
+    endpoint=urlsplit(args.url)
+    if endpoint.username or endpoint.password or endpoint.query or endpoint.fragment or not (
+            endpoint.scheme=="https" or endpoint.scheme=="http" and endpoint.hostname in ("localhost","127.0.0.1","::1")):
+        p.error("Remote BACKEND_URL requires HTTPS")
+    secret=os.getenv(args.feed_token_env)
+    if not secret: p.error("Missing account-specific feed credential")
+    headers={"Authorization":"Bearer "+secret}
     base=args.url.rstrip("/")+"/accounts/"+quote(args.account,safe="")
     if not mt5.initialize(args.terminal): raise SystemExit("Terminal unavailable")
     def publish(path,data):
-        response=requests.post(base+path,json=data,headers=headers,timeout=(2,35))
+        response=requests.post(base+path,json=data,headers=headers,allow_redirects=False,timeout=(2,35))
         response.raise_for_status()
-    response=requests.get(base+"/feed-config",headers=headers,timeout=5)
+    response=requests.get(base+"/feed-config",headers=headers,allow_redirects=False,timeout=5)
     response.raise_for_status()
     config=response.json()
     symbols=args.symbols or config["symbols"]
@@ -63,17 +72,17 @@ def main():
                     if last.get(symbol)==boundary: continue
                     if symbol in futures and not futures[symbol].done(): continue
                     bars={}
-                    for name,tf in (("M5",mt5.TIMEFRAME_M5),("H1",mt5.TIMEFRAME_H1),("H4",mt5.TIMEFRAME_H4),("D1",mt5.TIMEFRAME_D1),("M15",mt5.TIMEFRAME_M15)):
+                    for timeframe,tf in (("M5",mt5.TIMEFRAME_M5),("H1",mt5.TIMEFRAME_H1),("H4",mt5.TIMEFRAME_H4),("D1",mt5.TIMEFRAME_D1),("M15",mt5.TIMEFRAME_M15)):
                         rows=mt5.copy_rates_from_pos(name,tf,1,250)
                         if rows is None: break
-                        bars[name]=[{k:r[k].item() for k in ("time","open","high","low","close","tick_volume")} for r in rows]
+                        bars[timeframe]=[{k:r[k].item() for k in ("time","open","high","low","close","tick_volume")} for r in rows]
                     if len(bars)==5 and bars["M5"] and bars["M5"][-1]["time"]+300==boundary*300:
                         futures[symbol]=pool.submit(publish,"/bars/"+quote(symbol,safe=""),bars)
                         last[symbol]=boundary
                 if time.monotonic()>=plan_due:
                     plan_due=time.monotonic()+1
                     try:
-                        response=requests.get(base+"/execution-plan",headers=headers,timeout=(2,3))
+                        response=requests.get(base+"/execution-plan",headers=headers,allow_redirects=False,timeout=(2,3))
                         response.raise_for_status()
                         plan=response.json()
                         matches=(plan.get("login"),plan.get("server"))==(args.login,args.server)

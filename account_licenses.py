@@ -1,4 +1,4 @@
-﻿"""Owner-issued account licenses and durable notification outbox."""
+"""Owner-issued account licenses and durable notification outbox."""
 import hashlib
 import json
 import os
@@ -14,28 +14,7 @@ from fastapi import APIRouter, Depends, Header, HTTPException
 from pydantic import BaseModel, Field
 
 router=APIRouter()
-SCHEMA="""
-CREATE TABLE IF NOT EXISTS mobile_license(id TEXT PRIMARY KEY,digest TEXT UNIQUE NOT NULL,
- account TEXT NOT NULL,scope TEXT NOT NULL,expires REAL,revoked INTEGER DEFAULT 0,
- device TEXT,login TEXT,server TEXT,generation INTEGER DEFAULT 0);
-CREATE TABLE IF NOT EXISTS push_device(license TEXT PRIMARY KEY,token TEXT UNIQUE NOT NULL);
-CREATE TABLE IF NOT EXISTS alert_event(seq INTEGER PRIMARY KEY,account TEXT,alert_id TEXT,payload TEXT,
- UNIQUE(account,alert_id));
-CREATE TABLE IF NOT EXISTS push_delivery(event INTEGER,license TEXT,generation INTEGER,
- due REAL DEFAULT 0,attempts INTEGER DEFAULT 0,PRIMARY KEY(event,license));
-"""
-
-
-@contextmanager
-def store():
-    db=sqlite3.connect(os.getenv("PAPER_STATE_DB",Path(__file__).with_name("paper_state.db")),timeout=10)
-    db.row_factory=sqlite3.Row
-    try:
-        db.executescript(SCHEMA)
-        db.execute("BEGIN IMMEDIATE")
-        yield db
-        db.commit()
-    finally: db.close()
+from control_storage import transaction as store
 
 
 def owner(authorization:str=Header(default="")):
@@ -139,9 +118,9 @@ def register_token(data:PushToken,authorization:str=Header(default=""),x_device_
     with store() as db:
         current=lookup(db,authorization)
         if current["device"]!=x_device_id: raise HTTPException(403,"Binding changed")
-        try:
-            db.execute("INSERT INTO push_device VALUES(?,?) ON CONFLICT(license) DO UPDATE SET token=excluded.token",(r["id"],data.token))
-        except sqlite3.IntegrityError: raise HTTPException(409,"Token already registered")
+        if db.execute("SELECT 1 FROM push_device WHERE token=? AND license<>?",(data.token,r["id"])).fetchone():
+            raise HTTPException(409,"Token already registered")
+        db.execute("INSERT INTO push_device VALUES(?,?) ON CONFLICT(license) DO UPDATE SET token=excluded.token",(r["id"],data.token))
     return {"registered":True}
 
 
@@ -154,13 +133,14 @@ def events(after:int=0,authorization:str=Header(default=""),x_device_id:str=Head
 
 
 def enqueue(db,account,alert):
-    cur=db.execute("INSERT OR IGNORE INTO alert_event(account,alert_id,payload) VALUES(?,?,?)",
+    cur=db.execute("INSERT INTO alert_event(account,alert_id,payload) VALUES(?,?,?) ON CONFLICT(account,alert_id) DO NOTHING RETURNING seq",
                    (account,alert["id"],json.dumps(alert)))
-    if cur.rowcount:
+    inserted=cur.fetchone()
+    if inserted:
         db.execute("""INSERT INTO push_delivery(event,license,generation)
                     SELECT ?,id,generation FROM mobile_license JOIN push_device ON license=id
                     WHERE account=? AND revoked=0 AND (expires IS NULL OR expires>?) AND scope!='EA_ONLY'""",
-                   (cur.lastrowid,account,time.time()))
+                   (inserted[0],account,time.time()))
 
 
 def deliver_one(project):
@@ -169,7 +149,7 @@ def deliver_one(project):
     with store() as db:
         row=db.execute("""SELECT p.event,p.license,p.attempts,d.token,e.payload FROM push_delivery p
           JOIN push_device d ON d.license=p.license JOIN mobile_license l ON l.id=p.license
-          JOIN alert_event e ON e.seq=p.event WHERE l.generation=p.generation AND NOT l.revoked
+          JOIN alert_event e ON e.seq=p.event WHERE l.generation=p.generation AND l.revoked=0
           AND (l.expires IS NULL OR l.expires>?) AND due<=? ORDER BY due LIMIT 1""",(time.time(),time.time())).fetchone()
         if not row: return False
         db.execute("UPDATE push_delivery SET due=?,attempts=attempts+1 WHERE event=? AND license=?",

@@ -22,6 +22,7 @@ ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
 @asynccontextmanager
 async def lifespan(app):
+    with licenses.store(): pass
     stop=threading.Event()
     project=os.getenv("FCM_PROJECT_ID")
     def dispatch():
@@ -41,6 +42,11 @@ async def lifespan(app):
 
 app=FastAPI(title="UniversalAI account control",lifespan=lifespan)
 app.include_router(licenses.router)
+
+@app.get("/health")
+def health():
+    with licenses.store() as db: db.execute("SELECT 1")
+    return {"status":"ok"}
 
 
 
@@ -81,6 +87,7 @@ class Toggle(Payload):
 
 
 class Settings(Payload):
+    ai_gate_enforce:bool|None=None
     risk_pct:float|None=Field(default=None,gt=0,le=.75)
     daily_loss_cap_pct:float|None=Field(default=None,gt=0,le=2.5)
     max_dd_cap_pct:float|None=Field(default=None,gt=0,le=7.5)
@@ -144,12 +151,9 @@ signals=authorize("control","SIGNALS_ONLY")
 
 
 @contextmanager
-def state(account,cfg):
-    db=sqlite3.connect(os.getenv("PAPER_STATE_DB",ROOT/"paper_state.db"),timeout=10)
-    try:
-        db.execute("CREATE TABLE IF NOT EXISTS engines(account TEXT PRIMARY KEY, state TEXT NOT NULL)")
-        db.executescript(licenses.SCHEMA)
-        db.execute("BEGIN IMMEDIATE")
+def state(account,cfg,*,include_db=False):
+    from control_storage import transaction
+    with transaction("engine:"+account) as db:
         row=db.execute("SELECT state FROM engines WHERE account=?",(account,)).fetchone()
         if row:
             s=json.loads(row[0])
@@ -163,12 +167,9 @@ def state(account,cfg):
             s=dict(profile=cfg["profile"],config=profile,balance=balance,peak=balance,day_open=balance,
                    day="",locked=None,positions=[],history=[],quotes={},bias={},calendar=None,used={})
         count=len(s.get("alerts",[]))
-        yield s
+        yield (s,db) if include_db else s
         for alert in s.get("alerts",[])[count:]: licenses.enqueue(db,account,alert)
-        db.execute("INSERT OR REPLACE INTO engines VALUES(?,?)",(account,json.dumps(s,allow_nan=False)))
-        db.commit()
-    finally:
-        db.close()
+        db.execute("INSERT INTO engines VALUES(?,?) ON CONFLICT(account) DO UPDATE SET state=excluded.state",(account,json.dumps(s,allow_nan=False)))
 
 
 def pnl(s,p):
@@ -261,7 +262,7 @@ def enter(account:str,intent:Intent,cfg=Depends(feed)):
         return admit(s,intent,now)
 
 
-def admit(s,intent,now,rule=None):
+def admit(s,intent,now,rule=None,ai=None):
     rollover(s,now)
     risk(s,now)
     c=s["config"]; ps=s["positions"]
@@ -279,6 +280,8 @@ def admit(s,intent,now,rule=None):
     if setup and s["used"].get(key,0)>=setup["max_trades_per_session"]: reason="Session limit"
     bias=s["bias"].get(intent.symbol,{})
     if now-bias.get("as_of",0)>300 or bias.get("direction")!=("BULLISH" if intent.side=="BUY" else "BEARISH"): reason="Missing or conflicting market bias"
+    if setup and setup.get("id") in {"XAUUSD_ORB","XAUUSD_EMA_VWAP","GER40_EMA_VWAP"} and c.get("ai_gate_enforce",False) and (not ai or ai["decision"]!="APPROVE"):
+        reason="AI veto or unavailable"
     if reason: return {"command":"WAIT","reason":reason}
     buy=intent.side=="BUY"; entry=q["ask" if buy else "bid"]
     if not (intent.stop<q["bid"]<=entry<intent.target if buy else intent.target<entry<=q["ask"]<intent.stop):
@@ -290,6 +293,7 @@ def admit(s,intent,now,rule=None):
     position=dict(**intent.model_dump(),entry=entry,volume=volume,opened_at=now,exit_rule=rule)
     if intent.symbol=="XAUUSD" and session=="London":
         position["session_end"]=clock.astimezone(ZoneInfo("America/New_York")).replace(hour=9,minute=30,second=0,microsecond=0).timestamp()
+    if ai: position["ai"]=ai
     ps.append(position)
     s.setdefault("alerts",[]).append(dict(position,setup_id=setup.get("id"),execution_mode=c.get("execution_mode","paper")))
     s["used"][key]=s["used"].get(key,0)+1
@@ -358,6 +362,20 @@ class HistoryBars(Payload):
     M15:list[BiasBar]=Field(min_length=1,max_length=500)
 
 
+def admit_reviewed_candidate(s,symbol,setup,side,stop,end,snapshot,review_id,assessment=None):
+    now=time.time()
+    q=s["quotes"].get(symbol)
+    if not q or not 0<=now-end<=30 or s["bias"][symbol]["as_of"]!=snapshot["as_of"]: return
+    rule=setup["profile"].split("/")[0]
+    rr={"partialtrail":1.,"be":1.,"2R":2.,"1.5R":1.5}[rule]
+    entry=q["ask"] if side==1 else q["bid"]
+    target=entry+rr*(entry-stop)
+    if target<=0: return
+    intent=Intent(id=review_id,symbol=symbol,strategy=setup["strategy"],
+                  side="BUY" if side==1 else "SELL",stop=stop,target=target)
+    admit(s,intent,now,rule,assessment)
+
+
 @app.post("/accounts/{account}/bars/{symbol}")
 def update_bias(account:str,symbol:str,bars:HistoryBars,cfg=Depends(feed)):
     import pandas as pd
@@ -391,17 +409,37 @@ def update_bias(account:str,symbol:str,bars:HistoryBars,cfg=Depends(feed)):
                     if end-300>=int(p["opened_at"]//300)*300 and (high>=p["target"] if buy else low>=p["target"]):
                         p["stop"]=p["entry"]
             q=s["quotes"].get(symbol)
-            for setup,side,stop,end in candidates:
-                if not q: continue
-                rule=setup["profile"].split("/")[0]
-                rr={"partialtrail":1.,"be":1.,"2R":2.,"1.5R":1.5}[rule]
-                entry=q["ask"] if side==1 else q["bid"]
-                target=entry+rr*(entry-stop)
-                if target<=0: continue
-                intent=Intent(id=f"{symbol}/{setup['strategy']}/{end}",symbol=symbol,strategy=setup["strategy"],
-                              side="BUY" if side==1 else "SELL",stop=stop,target=target)
-                admit(s,intent,now,rule)
-    note=commentary(snapshot)
+            pending=candidates
+            atr={tf:values[2] for tf,values in last.items() if math.isfinite(values[2])}
+        else:
+            pending=[]; atr={}
+        cal=s.get("calendar") or {}
+        context={"market":snapshot.copy(),"atr14":atr,"news_pause":calendar_pause(s,now),
+                 "calendar_covered":cal.get("start",now+1)<=now-900 and cal.get("end",0)>=now+900,
+                 "upcoming_events":[e for e in cal.get("events",[]) if now-900<=e["timestamp"]<=now+14400
+                                    and e["currency"].upper() in ("USD","EUR") and e["impact"].lower()=="high"]}
+    # Model I/O must never hold the transaction used to mark equity or flatten.
+    from signal_ai import review
+    latest=None
+    for setup,side,stop,end in pending:
+        review_id=f"{symbol}/{setup['strategy']}/{end}"
+        with state(account,cfg) as s:
+            if any(row["id"]==review_id for row in s.get("ai_reviews",[])): continue
+            enforced=s["config"].get("ai_gate_enforce",False)
+            if not enforced:
+                admit_reviewed_candidate(s,symbol,setup,side,stop,end,snapshot,review_id)
+        assessment=review({**context,"candidate":{"id":setup.get("id"),"side":"BUY" if side==1 else "SELL",
+                                                    "stop":stop,"signal_close":end,"profile":setup["profile"]}})
+        latest=assessment
+        with state(account,cfg) as s:
+            if any(row["id"]==review_id for row in s.get("ai_reviews",[])): continue
+            now=time.time()
+            reviews=s.setdefault("ai_reviews",[])
+            reviews.append(dict(id=review_id,at=now,**assessment))
+            del reviews[:-200]
+            if enforced:
+                admit_reviewed_candidate(s,symbol,setup,side,stop,end,snapshot,review_id,assessment)
+    note=latest or (review(context) if os.getenv("AI_API_KEY") else commentary(snapshot))
     if note:
         with state(account,cfg) as s:
             if s["bias"][symbol]["as_of"]==snapshot["as_of"]: s["bias"][symbol]["ai"]=note
@@ -484,13 +522,17 @@ def register_ea(data:Registration,authorization:str=Header(default=""),x_device_
 
 @app.get("/accounts/{account}/execution-plan")
 def execution_plan(account:str,cfg=Depends(feed)):
-    with state(account,cfg) as s:
+    with state(account,cfg,include_db=True) as (s,db):
         reg=s.get("registration")
         if not reg: return {"registered":False}
-        with sqlite3.connect(os.getenv("PAPER_STATE_DB",ROOT/"paper_state.db")) as db:
-            valid=db.execute("""SELECT 1 FROM mobile_license WHERE id=? AND generation=? AND NOT revoked
+        valid=db.execute("""SELECT 1 FROM mobile_license WHERE id=? AND generation=? AND revoked=0
                 AND (expires IS NULL OR expires>?) AND account=? AND login=? AND server=?""",
                 (reg["license_id"],reg["generation"],time.time(),account,reg["login"],reg["server"])).fetchone()
         enabled=bool(valid and reg["enabled"] and not s["locked"])
         return {"registered":True,"enabled":enabled,"login":reg["login"],"server":reg["server"],
                 "positions":s["positions"] if enabled else [],"risk":s["config"]}
+
+
+@app.get("/accounts/{account}/ai-reviews")
+def ai_reviews(account:str,cfg=Depends(signals)):
+    with state(account,cfg) as s: return s.get("ai_reviews",[])

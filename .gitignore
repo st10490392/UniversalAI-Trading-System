@@ -17,3 +17,6 @@ logs/
 
 paper_state.db*
 mt5_execution.db*
+
+.bridge.env
+.bridge-venv/
