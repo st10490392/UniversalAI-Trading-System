@@ -120,7 +120,7 @@ Run `python evaluate_deterministic.py` to evaluate the rolling ORB and EMA pullb
 
 ## Mobile paper account control
 
-Run the paper API with `python -m uvicorn paper_control:app --host 127.0.0.1 --port 8010`. Its OpenAPI schema is at `/openapi.json`. Use HTTPS through the deployment reverse proxy for mobile access. The control service uses its own paper database and has no order-sending broker adapter.
+Run the paper API with `python -m uvicorn paper_control:app --host 127.0.0.1 --port 8010`. Its OpenAPI schema is at `/openapi.json`. Use HTTPS through the deployment reverse proxy for mobile access. The control service uses its own SQLite database. Broker dispatch requires explicit licensed enrollment and a matching bridge.
 
 Set `PAPER_ACCOUNTS_JSON` in the server environment. Each key is a mobile account identifier. For example:
 
@@ -173,7 +173,7 @@ Set each account record's `profile` and `config` fields in `PAPER_ACCOUNTS_JSON`
 | prop_firm_matchtrader | config/prop_firm_matchtrader.json | Signal-only MatchTrader alerts, market bias and shadow equity. Manual broker fills are tracked separately by the trader. |
 | deriv_synthetics_mt5 | config/deriv_synthetics_mt5.json | USD terminal, 24/7 eligibility, fixed-dollar risk and daily loss lock, news disabled. The sample external synthetic setup starts disabled. |
 
-For Deriv, enable the desired setup via PATCH settings and submit strategy-confirmed intents via the feed endpoint. `risk_amount_usd` and `daily_loss_cap_usd` are hot-reloadable on dollar-risk profiles. The bridge checks terminal currency. All templates use `paper_mode: true`; the MT5 connector receives market data and the execution ledger simulates fills. No live order switch is exposed.
+For Deriv, enable the desired setup via PATCH settings and submit strategy-confirmed intents via the feed endpoint. `risk_amount_usd` and `daily_loss_cap_usd` are hot-reloadable on dollar-risk profiles. The bridge checks terminal currency. All templates use `paper_mode: true`; the MT5 connector receives market data and the execution ledger simulates fills. See licensed enrollment below for the optional broker adapter.
 
 ### Calendar and risk
 
