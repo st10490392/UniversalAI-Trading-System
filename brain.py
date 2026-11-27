@@ -20,6 +20,7 @@ from pydantic import BaseModel, Field
 from dotenv import load_dotenv
 from research_lab import STRATEGIES as RESEARCH_STRATEGIES, live_candidates
 from strategies import SIGNAL_SCHEMA, _make_wait, validate_signal
+import demo_orb
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
@@ -383,7 +384,24 @@ def analyze_symbol(symbol:str,account_id:str|None=None,now:datetime|None=None)->
     if not strategy_names:return None
     m15=_mt5_rates(symbol,"M15")
     if m15 is None:return None
-    bar_time=int(m15.time.iloc[-1]) if "time" in m15.columns else int(time.time()//900)
+    if m15.empty or "time" not in m15:
+        return _wait_signal("Missing M15 timestamps")
+    stamps=pd.to_datetime(m15.time,unit="s" if pd.api.types.is_numeric_dtype(m15.time) else None,utc=True,errors="coerce")
+    if stamps.isna().any() or stamps.duplicated().any() or not stamps.is_monotonic_increasing:
+        return _wait_signal("Invalid M15 timestamps")
+    bar_time=int(stamps.iloc[-1].timestamp())
+    age=(now.timestamp() if now else time.time())-bar_time
+    if not 900 <= age < 1800:
+        return _wait_signal("Stale or incomplete M15 bar")
+    price_columns=["open","high","low","close"]
+    if not set(price_columns).issubset(m15):
+        return _wait_signal("Missing M15 OHLC")
+    prices=m15[price_columns].apply(pd.to_numeric,errors="coerce")
+    bounds=prices[["open","close"]]
+    if (not np.isfinite(prices.to_numpy()).all() or (prices<=0).any().any()
+            or (prices.low>bounds.min(axis=1)).any() or (prices.high<bounds.max(axis=1)).any()):
+        return _wait_signal("Invalid M15 OHLC")
+    m15=m15.assign(time=stamps,**{key:prices[key] for key in price_columns})
     signature=strategy_names+(str(APPROVED_PATH.stat().st_mtime_ns) if APPROVED_PATH.exists() else "missing",)
     cached=_analysis_cache.get(symbol)
     if cached and cached[0]==bar_time and cached[1]==signature:
@@ -513,8 +531,56 @@ def logs(account_id:str,limit:int=Query(50,ge=1,le=200),auth:LicenseContext=Depe
     if account_id!=auth.account_id:raise HTTPException(403,"Account does not match the activated license")
     with _connect() as c:return [dict(r) for r in c.execute("SELECT * FROM trade_logs WHERE account_id=? ORDER BY id DESC LIMIT ?",(account_id,limit))]
 
+_demo_orb_cache:dict[tuple[str,str],tuple[int,dict[str,Any]]]={}
+
+
+def evaluate_demo_orb(account_id:str,symbol:str,account:Any)->dict[str,Any]:
+    """Dedicated opt-in path. The live approval registry is never consulted here."""
+    if os.getenv("ENABLE_DEMO_ROLLING_ORB")!="1" or symbol!=demo_orb.SYMBOL:
+        return _wait_signal("Demo Rolling ORB is disabled or the symbol is unsupported")
+    if account["account_type"]!="broker" or account["risk_pct"]!=demo_orb.RISK_PCT:
+        return _wait_signal("Demo Rolling ORB requires a broker account profile with exactly 0.25% risk")
+    try:
+        import MetaTrader5 as mt5
+    except ImportError:
+        return _wait_signal("MT5 integration is unavailable; broker constraints cannot be queried offline")
+    terminal_path=os.getenv("DEMO_MT5_TERMINAL_PATH")
+    if not (mt5.initialize(terminal_path) if terminal_path else mt5.initialize()):
+        return _wait_signal("Cannot connect to MT5 to verify demo mode and broker constraints")
+    try:
+        connected,info,tick=demo_orb.demo_broker_snapshot(mt5,account_id,account["broker_server"])
+        rates=mt5.copy_rates_from_pos(symbol,mt5.TIMEFRAME_M15,1,500)
+        context=demo_orb.rolling_orb_context(rates,info,tick)
+        if not 900 <= time.time()-context["bar_time"] < 1800:
+            return _wait_signal("Stale or incomplete demo M15 bar")
+        lots=demo_orb.check_demo_volume(mt5,connected,info,context)
+    except demo_orb.DemoUnavailable as exc:
+        return _wait_signal(str(exc))
+    finally:
+        mt5.shutdown()
+
+    bar=context["bar_time"]
+    cache_key=(account_id,account["broker_server"])
+    cached=_demo_orb_cache.get(cache_key)
+    if cached and cached[0]==bar:
+        result=cached[1]
+        return {**result,"demo_preflight_lots":lots} if result["command"]!="WAIT" else result
+    signal=evaluate_llm_signal(context)
+    if signal["command"]=="WAIT":
+        result=_wait_signal(signal["reason"])
+    elif (signal["sl"],signal["tp"])!=(context["setup"]["stop"],context["setup"]["target"]):
+        result=_wait_signal("Demo Rolling ORB levels must match the deterministic setup exactly")
+    else:
+        result={**signal,"decision":signal["command"],"entry":context["setup"]["entry_reference"],
+                "symbol":symbol,"strategy":context["strategy"],"setup":context["setup"],"bar_time":bar,
+                "signal_id":f"{symbol}-{bar}-demo-orb","execution_profile":demo_orb.PROFILE,
+                "demo_preflight_lots":lots}
+    _demo_orb_cache[cache_key]=(bar,result)
+    return result
+
+
 @app.get("/api/ea/poll/{account_id}/{symbol}")
-def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default=""),x_device_id:str=Header(default="")):
+def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Account-Balance"),equity:float=Header(default=0,alias="X-Account-Equity"),x_license_key:str=Header(default=""),x_device_id:str=Header(default=""),demo_orb_profile:bool=False):
     init_db()
     if not _ea_authorized(x_license_key,account_id,x_device_id):return {"command":"UNAUTHORIZED"}
     with _connect() as c:
@@ -523,7 +589,8 @@ def ea_poll(account_id:str,symbol:str,balance:float=Header(default=0,alias="X-Ac
         c.execute("INSERT INTO account_state(account_id,balance,equity) VALUES(?,?,?) ON CONFLICT(account_id) DO UPDATE SET balance=excluded.balance,equity=excluded.equity,updated_at=CURRENT_TIMESTAMP",(account_id,balance,equity))
     if not a["active"]:return {**_wait_signal("Account stopped"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     with _scanner_lock:
-        try:result=analyze_symbol(symbol,account_id)
+        try:
+            result=evaluate_demo_orb(account_id,symbol,a) if demo_orb_profile else analyze_symbol(symbol,account_id)
         except Exception:LOG.exception("analyze_symbol failed for %s",symbol);result=None
     if not result or result["decision"] not in ("BUY","SELL"):return {**_wait_signal(result["reason"] if result else "No qualified setup"),"risk_pct":a["risk_pct"],"max_daily_dd_pct":a["max_daily_dd_pct"],"max_total_dd_pct":a["max_total_dd_pct"]}
     result=dict(result)  # never mutate the per-symbol cache shared across accounts/threads

@@ -209,7 +209,7 @@ def test_approved_live_candidate_passes_exact_setup_and_quant_to_qwen(monkeypatc
     monkeypatch.setattr(brain,"APPROVED_PATH",path)
     times=pd.date_range("2025-01-01",periods=80,freq="15min",tz="UTC")
     close=1.1+np.arange(80)*.0001
-    rates=pd.DataFrame({"time":(times.astype("int64")//10**9).astype(int),"open":close,"high":close+.0001,"low":close-.0001,"close":close,"tick_volume":100})
+    rates=pd.DataFrame({"time":[int(t.timestamp()) for t in times],"open":close,"high":close+.0001,"low":close-.0001,"close":close,"tick_volume":100})
     monkeypatch.setattr(brain,"_mt5_rates",lambda *a,**k:rates.copy())
     setup={"rule":"ema_cross_rsi_atr_expansion","entry_reference":1.2,"stop":1.19,"target":1.225,"risk_reward":2.5}
     quant={"atr14":.01,"atr_ratio":1.2,"zscore":.4,"er20":.4,"rsi":60}
@@ -224,7 +224,7 @@ def test_approved_live_candidate_passes_exact_setup_and_quant_to_qwen(monkeypatc
     reply.json.side_effect=lambda: {"choices":[{"finish_reason":"stop","message":{"content":json.dumps(result)}}]}
     post=Mock(return_value=reply)
     monkeypatch.setattr(brain.requests,"post",post)
-    out=brain.analyze_symbol("EURUSD")
+    out=brain.analyze_symbol("EURUSD",now=times[-1]+pd.Timedelta(minutes=15))
     assert out["decision"]=="BUY" and out["strategy"]=="Trend Momentum" and out["breakeven_at_r"]==1.2
     messages=post.call_args.kwargs["json"]["messages"]
     assert [message["role"] for message in messages]==["system","user"]
@@ -232,9 +232,12 @@ def test_approved_live_candidate_passes_exact_setup_and_quant_to_qwen(monkeypatc
     assert out["entry"]==setup["entry_reference"] and out["command"]=="BUY"
     assert context["setup"]==setup and context["quant_metrics"]==quant
 
+    for minutes in (0, 14, 30, 60):
+        blocked=brain.analyze_symbol("EURUSD",now=times[-1]+pd.Timedelta(minutes=minutes))
+        assert blocked["command"]=="WAIT" and blocked["sl"]==blocked["tp"]==blocked["confidence"]==0
     brain._analysis_cache.clear()
     result["sl"]=1.21
-    out=brain.analyze_symbol("EURUSD")
+    out=brain.analyze_symbol("EURUSD",now=times[-1]+pd.Timedelta(minutes=15))
     assert out["command"]==out["decision"]=="WAIT"
     assert out["sl"]==out["tp"]==out["confidence"]==0.0
 

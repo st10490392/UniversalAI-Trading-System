@@ -53,6 +53,9 @@ def load_history(path: str | Path) -> pd.DataFrame:
     d["time"] = pd.to_datetime(d.time, utc=True, errors="raise")
     for col in ("open", "high", "low", "close"):
         d[col] = pd.to_numeric(d[col], errors="raise")
+    for legacy, canonical in (("point", "point_size"), ("volume", "tick_volume")):
+        if legacy in d and canonical not in d:
+            d[canonical] = d[legacy]
     defaults = {"tick_volume": 1, "spread_points": 0, "point_size": 0.00001, "tick_size": 0.00001, "tick_value": 0.0, "asset_class": ""}
     for col, value in defaults.items():
         if col not in d:
@@ -95,7 +98,7 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     delta = c.diff()
     gain = delta.clip(lower=0).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
     loss = (-delta.clip(upper=0)).ewm(alpha=1/14, min_periods=14, adjust=False).mean()
-    d["rsi"] = (100 - 100 / (1 + gain / loss.replace(0, np.nan))).fillna(50)
+    d["rsi"] = (100 * gain / (gain + loss).replace(0, np.nan)).fillna(50)
     mean50 = c.rolling(50, min_periods=50).mean()
     std50 = c.rolling(50, min_periods=50).std(ddof=0)
     d["zscore"] = ((c - mean50) / std50.replace(0, np.nan)).fillna(0)
@@ -114,6 +117,7 @@ def add_indicators(data: pd.DataFrame) -> pd.DataFrame:
     d["upper_wick_ratio"] = ((h-pd.concat((c,d.open.astype(float)),axis=1).max(axis=1))/span).fillna(0).clip(0, 1)
     d["lower_wick_ratio"] = ((pd.concat((c,d.open.astype(float)),axis=1).min(axis=1)-l)/span).fillna(0).clip(0, 1)
     d["volatility_regime"] = (d.atr_ratio > 1.2).astype(float)
+    d["market_regime"] = np.select([d.atr_ratio.isna() | er_den.isna(), d.atr_ratio > 1.2, d.er20 >= .35], ["unknown", "high-volatility", "trend"], default="range")
     d["hour"] = d.time.dt.hour.astype(float)
     return d
 
@@ -174,8 +178,8 @@ def build_signals(data: pd.DataFrame, symbol: str, strategy: str) -> tuple[np.nd
         asian=(ny.dt.hour<7).to_numpy()
         # Keep the Asian range causal at every bar, even though valid Judas
         # entries occur after the defined Asian session has completed.
-        day_hi=pd.Series(np.where(asian,h,np.nan)).groupby(ny_day).transform(lambda x:x.cummax().shift(1)).to_numpy()
-        day_lo=pd.Series(np.where(asian,l,np.nan)).groupby(ny_day).transform(lambda x:x.cummin().shift(1)).to_numpy()
+        day_hi=pd.Series(np.where(asian,h,np.nan)).groupby(ny_day).transform(lambda x:x.cummax().ffill().shift(1)).to_numpy()
+        day_lo=pd.Series(np.where(asian,l,np.nan)).groupby(ny_day).transform(lambda x:x.cummin().ffill().shift(1)).to_numpy()
         structure_hi=pd.Series(h).rolling(3,min_periods=3).max().shift(1).to_numpy(); structure_lo=pd.Series(l).rolling(3,min_periods=3).min().shift(1).to_numpy()
         judas_sell=session&(ny_minutes>=420)&(ny_minutes<600)&(h>day_hi)&(c<day_hi)&(c<structure_lo)
         judas_buy=session&(ny_minutes>=420)&(ny_minutes<600)&(l<day_lo)&(c>day_lo)&(c>structure_hi)
@@ -208,7 +212,7 @@ def build_signals(data: pd.DataFrame, symbol: str, strategy: str) -> tuple[np.nd
     return side,stop,target,code
 
 
-def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0, absolute_stop: bool=False, reward_risk: float=2.5) -> dict[str, Any] | None:
+def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_price: float, *, breakeven: bool, commission_per_lot: float, slippage_points: float, commission_points: float, end_idx: int, horizon: int=96, entry_delay_bars: int=0, absolute_stop: bool=False, reward_risk: float|None=2.5) -> dict[str, Any] | None:
     if entry_delay_bars < 0:
         raise ValueError("entry_delay_bars cannot be negative")
     entry_i=i+1+entry_delay_bars
@@ -222,12 +226,15 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
     base_open=float(d.open.iloc[entry_i]); entry=base_open+spread+slip if side>0 else base_open-slip
     stop=stop_dist if absolute_stop else entry-side*stop_dist
     risk=side*(entry-stop) if absolute_stop else stop_dist
-    if risk<=0:return None
+    if not np.isfinite(risk) or risk<=0 or not np.isfinite(entry) or entry<=0 or stop<=0:return None
     if np.isfinite(target_price):
         target=float(target_price)
-        if (side>0 and target<=entry) or (side<0 and target>=entry):
+        if target<=0 or (side>0 and target<=entry) or (side<0 and target>=entry):
             return None
+    elif reward_risk is None:
+        target=math.inf if side>0 else -math.inf  # stop or session cutoff only
     else:
+        if not np.isfinite(reward_risk) or reward_risk<=0:return None
         target=entry+side*risk*reward_risk
         if not np.isfinite(target) or target<=0:return None
     if commission_per_lot>0 and tick_size>0 and tick_value>0:
@@ -263,9 +270,11 @@ def _trade_one(d: pd.DataFrame, i: int, side: int, stop_dist: float, target_pric
     if out_price is None:
         j=max(entry_i,last-1)
         # A short is bought back at ask (bid close + spread), not bid minus spread.
-        out_price=float(d.close.iloc[j])+(max(float(d.spread_points.iloc[j]),0.0)*point if side<0 else 0.0)-side*max(slippage_points,0.0)*point
+        exit_point=float(d.point_size.iloc[j])
+        closing_spread=max(float(d.spread_points.iloc[j]),0.0)*exit_point if side<0 else 0.0
+        out_price=float(d.close.iloc[j])+closing_spread-side*max(slippage_points,0.0)*exit_point
     r=side*(out_price-entry)/risk-cost_r
-    return {"time":d.time.iloc[entry_i].isoformat(),"r":float(r),"outcome":outcome,"entry":float(entry),"exit":float(out_price),"bars_held":int(j-entry_i+1),"entry_delay_bars":entry_delay_bars}
+    return {"time":d.time.iloc[entry_i].isoformat(),"r":float(r),"outcome":outcome,"entry":float(entry),"exit":float(out_price),"bars_held":int(j-entry_i+1),"entry_delay_bars":entry_delay_bars,"entry_index":entry_i,"exit_index":j}
 
 
 def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray,np.ndarray], *, start: str, end: str, commission_per_lot: float=7.0, slippage_points: float=2.0, commission_points: float=1.0, breakeven: bool=False, horizon: int=96, spread_multiplier: float=1.0, spread_fallback_points: float=20.0, entry_delay_bars: int=0, random_delay_max_bars: int=0, seed: int=42, absolute_stops: bool=False) -> list[dict[str,Any]]:
@@ -278,7 +287,7 @@ def simulate(data: pd.DataFrame, signals: tuple[np.ndarray,np.ndarray,np.ndarray
     side, stops, targets, _ = signals; times=data.time
     start_ts=pd.Timestamp(start,tz="UTC"); end_ts=pd.Timestamp(end,tz="UTC")
     valid=np.flatnonzero((side!=0)&(times>=start_ts).to_numpy()&(times<end_ts).to_numpy())
-    end_idx=int(np.searchsorted(times.astype("int64").to_numpy(),end_ts.value,side="left"))
+    end_idx=int(times.searchsorted(end_ts,side="left"))
     trades=[]; next_free=0
     for i in valid:
         if i<next_free: continue
@@ -465,7 +474,7 @@ def _fit_xgb(d: pd.DataFrame, raw: tuple[np.ndarray,np.ndarray,np.ndarray,np.nda
     sides,stops,targets,_=raw; times=d.time
     start_ts=pd.Timestamp(start,tz="UTC");cut_ts=pd.Timestamp(cutoff,tz="UTC")
     candidates=np.flatnonzero((sides!=0)&(times>=start_ts).to_numpy()&(times<cut_ts).to_numpy())
-    end_idx=int(np.searchsorted(times.astype("int64").to_numpy(),cut_ts.value,side="left"))
+    end_idx=int(times.searchsorted(cut_ts,side="left"))
     xi=[]; yi=[]
     for i in candidates:
         label=_trade_one(d,int(i),int(sides[i]),float(stops[i]),float(targets[i]),breakeven=False,commission_per_lot=args.commission_per_lot,slippage_points=args.slippage_points,commission_points=args.commission_points,end_idx=end_idx,horizon=96)

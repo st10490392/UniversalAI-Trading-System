@@ -10,6 +10,7 @@ input string LicenseKey="";
 input int PollSeconds=2;
 input long MagicNumber=20261125;
 input int SlippagePoints=20;
+input bool DemoRollingORB=false;       // opt-in, Range Break 100 Index on MT5 demo only
 input int MaxSignalAgeSeconds=1800;   // reject signals whose M15 bar is older than this (server time)
 
 #define HARD_DAILY_DD_PCT 5.0
@@ -49,7 +50,7 @@ bool HasOpenPosition()
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong t=PositionGetTicket(i);if(t==0)continue;
-      if(PositionGetInteger(POSITION_MAGIC)==MagicNumber && PositionGetString(POSITION_SYMBOL)==_Symbol)return true;
+      if(PositionGetString(POSITION_SYMBOL)==_Symbol)return true;
    }
    return false;
 }
@@ -77,7 +78,8 @@ void CloseMagicPositions()
    for(int i=PositionsTotal()-1;i>=0;i--)
    {
       ulong ticket=PositionGetTicket(i);if(ticket==0)continue;
-      if(PositionGetInteger(POSITION_MAGIC)==MagicNumber)
+      if(PositionGetInteger(POSITION_MAGIC)==MagicNumber &&
+         (!DemoRollingORB || PositionGetString(POSITION_SYMBOL)==_Symbol))
          trade.PositionClose(ticket);
    }
 }
@@ -132,6 +134,7 @@ void LoadState(const double equity)
 
 void CheckCircuit()
 {
+   if(!DemoOrbAccountAllowed()){circuit_open=true;return;}
    double equity=AccountInfoDouble(ACCOUNT_EQUITY);
    if(equity<=0.0 || !MathIsValidNumber(equity)){circuit_open=true;return;}   // unknown equity: block entries, never trade blind
    datetime day=DayStart(TimeCurrent());
@@ -218,11 +221,26 @@ void ManageBreakeven()
    }
 }
 
+bool DemoOrbAccountAllowed()
+{
+   return !DemoRollingORB ||
+          (AccountInfoInteger(ACCOUNT_TRADE_MODE)==ACCOUNT_TRADE_MODE_DEMO && _Symbol=="Range Break 100 Index");
+}
+
+bool SignalProfileAllowed(const string json)
+{
+   string profile=JsonString(json,"execution_profile");
+   if(!DemoRollingORB)return profile=="";
+   return DemoOrbAccountAllowed() && profile=="demo_rolling_orb" && JsonNumber(json,"risk_pct",0.0)==0.25;
+}
+
 bool SendPoll(string &response)
 {
+   if(!DemoOrbAccountAllowed())return false;
    long login=AccountInfoInteger(ACCOUNT_LOGIN);
    string safe_symbol=_Symbol;StringReplace(safe_symbol,"%","%25");StringReplace(safe_symbol," ","%20");StringReplace(safe_symbol,"#","%23");
    string url=ServerURL+"/api/ea/poll/"+(string)login+"/"+safe_symbol;
+   if(DemoRollingORB)url+="?demo_orb_profile=true";
    char data[],result[];
    string request_headers="X-License-Key: "+LicenseKey+"\r\n"+
       "X-Account-Balance: "+DoubleToString(AccountInfoDouble(ACCOUNT_BALANCE),2)+"\r\n"+
@@ -248,6 +266,7 @@ void HandleSignal(const string json)
 {
    if(authorization_failed)return;
    string decision=JsonString(json,"decision");if(decision!="BUY" && decision!="SELL"){pending_signal="";pending_signal_id="";return;}
+   if(!SignalProfileAllowed(json))return;
    string sid=JsonString(json,"signal_id");if(sid=="" || AlreadyHandled(sid,JsonNumber(json,"bar_time",0.0)) || sid==pending_signal_id)return;
    double confidence=JsonNumber(json,"confidence",0.0);if(confidence<0.75)return;
    double rp=JsonNumber(json,"risk_pct",0.0);if(rp<=0.0)return;   // unparsable risk must not fall through to min-lot sizing
@@ -264,13 +283,14 @@ void HandleSignal(const string json)
 
 void ExecuteSignal(const string json)
 {
+   if(!SignalProfileAllowed(json))return;
    CheckCircuit();   // re-check after the (up to 15 s) prop delay and the blocking WebRequest
    if(circuit_open || authorization_failed)return;
    string decision=JsonString(json,"decision"),sid=JsonString(json,"signal_id");
    if(decision!="BUY" && decision!="SELL")return;
    double bar=JsonNumber(json,"bar_time",0.0);
    if(sid=="" || AlreadyHandled(sid,bar))return;
-   if(bar>0.0 && (double)TimeCurrent()-bar>(double)MaxSignalAgeSeconds){Print("Stale signal skipped ",sid);RememberSignal(sid,bar);return;}
+   if(bar<=0.0 || (double)TimeCurrent()-bar<900 || (double)TimeCurrent()-bar>=MathMin(MaxSignalAgeSeconds,1800)){Print("Stale signal skipped ",sid);RememberSignal(sid,bar);return;}
    if(HasOpenPosition()){Print("Position already open on ",_Symbol,"; skipped ",sid);RememberSignal(sid,bar);return;}
    if(!TerminalInfoInteger(TERMINAL_TRADE_ALLOWED) || !MQLInfoInteger(MQL_TRADE_ALLOWED) || SymbolInfoInteger(_Symbol,SYMBOL_TRADE_MODE)!=SYMBOL_TRADE_MODE_FULL)return;
    double sl=JsonNumber(json,"sl",0),tp=JsonNumber(json,"tp",0);
@@ -282,7 +302,7 @@ void ExecuteSignal(const string json)
    double risk_distance=MathAbs(entry-sl),reward_distance=MathAbs(tp-entry);
    bool valid=(decision=="BUY")?(sl<entry && tp>entry):(tp<entry && sl>entry);
    double min_stop=(double)SymbolInfoInteger(_Symbol,SYMBOL_TRADE_STOPS_LEVEL)*_Point;
-   if(!valid || risk_distance<min_stop || reward_distance<min_stop || reward_distance/risk_distance<2.5)
+   if(sl<=0 || tp<=0 || !MathIsValidNumber(sl) || !MathIsValidNumber(tp) || !valid || risk_distance<min_stop || reward_distance<min_stop || reward_distance/risk_distance<2.5)
    { Print("Signal became invalid at market price; skipped ",sid);RememberSignal(sid,bar);return; }
    ENUM_ORDER_TYPE type=(decision=="BUY"?ORDER_TYPE_BUY:ORDER_TYPE_SELL);
    double used=0.0,lots=RiskLots(type,entry,sl,used);
@@ -292,6 +312,7 @@ void ExecuteSignal(const string json)
    double dnow=(daily_start_equity-eq)/daily_start_equity*100.0,tnow=(high_water_equity-eq)/high_water_equity*100.0;
    if(dnow+used>=max_daily_dd_pct || tnow+used>=max_total_dd_pct){Print("DD headroom too small for risk ",DoubleToString(used,2),"%; skipped ",sid);RememberSignal(sid,bar);return;}
    trade.SetExpertMagicNumber(MagicNumber);trade.SetDeviationInPoints(SlippagePoints);trade.SetTypeFillingBySymbol(_Symbol);
+   if(!DemoOrbAccountAllowed())return;
    RememberSignal(sid,bar);   // at-most-once: persist BEFORE sending so a timeout/crash cannot re-fire the same signal
    bool ok=(decision=="BUY")?trade.Buy(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid):trade.Sell(lots,_Symbol,0.0,sl,tp,"UniversalAI "+sid);
    if(ok)
@@ -331,7 +352,7 @@ void Poll()
 
 int OnInit()
 {
-   if(PollSeconds<1)return INIT_PARAMETERS_INCORRECT;
+   if(PollSeconds<1 || !DemoOrbAccountAllowed())return INIT_PARAMETERS_INCORRECT;
    trade.SetExpertMagicNumber(MagicNumber);trade.SetTypeFillingBySymbol(_Symbol);current_server_day=DayStart(TimeCurrent());
    LoadState(AccountInfoDouble(ACCOUNT_EQUITY));
    circuit_open=daily_lock||total_lock;
@@ -340,10 +361,11 @@ int OnInit()
    CheckCircuit();   // trip immediately on restart if floating loss already breaches a limit
    EventSetTimer(PollSeconds);return INIT_SUCCEEDED;
 }
-void OnDeinit(const int reason){PersistIfNeeded(true);EventKillTimer();}
-void OnTick(){CheckCircuit();ManageBreakeven();}
+void OnDeinit(const int reason){if(DemoOrbAccountAllowed())PersistIfNeeded(true);EventKillTimer();}
+void OnTick(){if(!DemoOrbAccountAllowed())return;CheckCircuit();ManageBreakeven();}
 void OnTimer()
 {
+   if(!DemoOrbAccountAllowed())return;
    CheckCircuit();
    Poll();
    if(poll_authorized && pending_signal!="" && TimeCurrent()>=pending_after){string p=pending_signal;pending_signal="";ExecuteSignal(p);}
