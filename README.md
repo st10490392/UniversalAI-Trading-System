@@ -180,3 +180,30 @@ For Deriv, enable the desired setup via PATCH settings and submit strategy-confi
 The bridge calls `POST /accounts/{account}/calendar/refresh` at startup and every 15 minutes. The API fetches Forex Factory weekly JSON, validates its week, and caches events in the account database. High-impact USD/EUR news blocks entries through both 15-minute boundaries. Fetch failure preserves the cache. Set `news.offline_fallback` to `block` (default) or `allow_paper` for offline testing. Known events still block in fallback mode. A feed client can also POST its own covered calendar.
 
 Daily limits use UTC day-opening marked equity. Total drawdown uses peak marked equity. New quotes synchronously update positions and enforce liquidation/locks. Daily locks reset on the next UTC day. Emergency and total-drawdown locks persist.
+
+### Owner licenses, broker enrollment and notifications
+
+Run the mobile API with `python -m uvicorn paper_control:app --host 127.0.0.1 --port 8010`. Use HTTPS for remote clients. This mobile license store shares the paper-account SQLite database and transaction boundary. Legacy brain/EA licenses belong to the separate brain service.
+
+Set a private `OWNER_MASTER_KEY` in the API environment. Send it as an Authorization bearer token only to the owner endpoints. In `PAPER_ACCOUNTS_JSON`, provision the engine account/profile and bridge feed-token environment variable first. A license is issued for that specific engine account. Keep owner, bridge and any legacy control tokens off licensed client devices.
+
+| Owner request | Purpose |
+|---|---|
+| POST /admin/licenses | JSON fields `account`, `scope`, optional timezone-aware ISO `expires_at`. Returns the key once. SQLite stores its SHA-256 digest. |
+| GET /admin/licenses or GET /admin/licenses/{id} | Inspect scope, expiration, revocation and bindings without exposing the bearer key. |
+| POST /admin/licenses/{id}/reset | Release device and broker binding and invalidate prior enrollment and push registration. |
+| POST /admin/licenses/{id}/revoke | Revoke access and disable enrollment. |
+
+Activate with `POST /licenses/activate`, Authorization bearer license key, and JSON `device_id`. EA_ONLY and FULL_ACCESS additionally require string `mt5_account_id` and exact `mt5_server`. Supply `X-Device-ID` alongside the bearer key on subsequent licensed requests. Device identity is client-asserted, so protect the key using platform secure storage. SIGNALS_ONLY grants bias, alerts and notification access. EA_ONLY grants account controls, status, history and registration. FULL_ACCESS grants both. Existing operator control/feed credentials retain their respective roles.
+
+For an EA-capable license, POST the following to `/ea/register-and-start`:
+
+```json
+{"mt5_account_id":"123456","mt5_server":"Deriv-Demo","risk_mode":"percent","risk_value":0.25,"daily_loss_cap":2.0,"max_dd_cap":5.0,"demo_live_execution":false}
+```
+
+`percent` uses percentages; `fixed_usd` uses USD trade risk and daily cap on a USD profile. Maximum drawdown is always a percentage. Enrollment configures the account; it does not log into MT5 or launch a terminal. Run exactly one bridge/terminal per broker account using the bridge command above. Leave `demo_live_execution` false for paper-only use. Signal-only profiles reject broker dispatch. Explicit true opts a connected matching bridge into broker orders. Both MT5 demo trade mode and a server name containing Demo are checked. The operator-only `ALLOW_REAL_ACCOUNTS=true` override must be present on the bridge for other accounts and on the API for non-Demo server names. Default is absent/false.
+
+Broker mode uses an account-specific magic number, symbol alias/suffix resolution, current quotes, stop-based broker profit and volume calculations, margin/order precheck and a durable send-attempt journal (`MT5_EXECUTION_DB`). Ambiguous symbols, minimum-lot violations and existing symbol positions block entry. Keep the journal across restarts. Market orders attach a protective SL; fixed-target profiles attach TP. Managed exits use the bridge for half-close at 1R, breakeven and bar-derived ATR stop updates. Keep the bridge, terminal and API online. A lost broker acknowledgement consumes that entry attempt to avoid duplicate orders. Broker equity limits include floating losses. Liquidation targets positions tagged by this adapter. API account metrics and history remain the shadow ledger; confirm broker fills/P&L in MT5. Revocation, reset, expiry or emergency pause removes desired broker exposure on the next successful synchronization. Previously documented paper-only behavior is the default prior to explicit enrollment.
+
+Register a signal-capable activated device via `POST /notifications/register-device` with JSON `{"token":"<FCM registration token>"}`. Read durable per-account alerts with `GET /notifications/events?after=0`; persist the highest returned sequence for the next poll. Local polling works without Firebase. For FCM HTTP v1 delivery, install requirements, set `FCM_PROJECT_ID` and provision Google Application Default Credentials with messaging permission (for example via `GOOGLE_APPLICATION_CREDENTIALS`). New alerts and their delivery jobs commit with the account update. Failed sends retry with backoff; clients should deduplicate by event_id.

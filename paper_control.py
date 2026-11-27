@@ -1,4 +1,7 @@
 """Account-scoped, SQLite-serialized paper execution. All prices are bid/ask."""
+import threading
+from contextlib import asynccontextmanager
+import account_licenses as licenses
 import json
 import math
 import os
@@ -17,7 +20,28 @@ from dotenv import load_dotenv
 
 ROOT=Path(__file__).resolve().parent
 load_dotenv(ROOT/".env",override=False)
-app=FastAPI(title="UniversalAI paper account control")
+@asynccontextmanager
+async def lifespan(app):
+    stop=threading.Event()
+    project=os.getenv("FCM_PROJECT_ID")
+    def dispatch():
+        while not stop.is_set():
+            try:
+                if licenses.deliver_one(project): continue
+            except Exception:
+                import logging
+                logging.getLogger(__name__).warning("FCM delivery pending; check credentials and project")
+            stop.wait(3)
+    worker=threading.Thread(target=dispatch,daemon=True) if project else None
+    if worker: worker.start()
+    try: yield
+    finally:
+        stop.set()
+        if worker: worker.join(timeout=12)
+
+app=FastAPI(title="UniversalAI account control",lifespan=lifespan)
+app.include_router(licenses.router)
+
 
 
 class Payload(BaseModel):
@@ -98,10 +122,14 @@ def calendar_pause(s,now):
     return reason
 
 
-def authorize(role):
-    def check(account:str,authorization:str=Header(default="")):
+def authorize(role,scope="EA_ONLY"):
+    def check(account:str,authorization:str=Header(default=""),x_device_id:str=Header(default="")):
         registry=json.loads(os.getenv("PAPER_ACCOUNTS_JSON","{}"))
         cfg=registry.get(account,{})
+        if role=="control" and authorization.startswith("Bearer uai_"):
+            licenses.licensed(authorization,x_device_id,scope,account)
+            if not cfg: raise HTTPException(403,"Unknown engine account")
+            return cfg
         token=os.getenv(cfg.get(role+"_token_env",""),"")
         tokens=[os.getenv(v.get(k,""),"") for v in registry.values() for k in ("control_token_env","feed_token_env")]
         if not token or tokens.count(token)!=1 or not secrets.compare_digest(authorization.encode(),("Bearer "+token).encode()):
@@ -112,6 +140,7 @@ def authorize(role):
 
 control=authorize("control")
 feed=authorize("feed")
+signals=authorize("control","SIGNALS_ONLY")
 
 
 @contextmanager
@@ -119,6 +148,7 @@ def state(account,cfg):
     db=sqlite3.connect(os.getenv("PAPER_STATE_DB",ROOT/"paper_state.db"),timeout=10)
     try:
         db.execute("CREATE TABLE IF NOT EXISTS engines(account TEXT PRIMARY KEY, state TEXT NOT NULL)")
+        db.executescript(licenses.SCHEMA)
         db.execute("BEGIN IMMEDIATE")
         row=db.execute("SELECT state FROM engines WHERE account=?",(account,)).fetchone()
         if row:
@@ -132,7 +162,9 @@ def state(account,cfg):
             if not math.isfinite(balance) or balance<=0: raise HTTPException(409,"Invalid paper capital")
             s=dict(profile=cfg["profile"],config=profile,balance=balance,peak=balance,day_open=balance,
                    day="",locked=None,positions=[],history=[],quotes={},bias={},calendar=None,used={})
+        count=len(s.get("alerts",[]))
         yield s
+        for alert in s.get("alerts",[])[count:]: licenses.enqueue(db,account,alert)
         db.execute("INSERT OR REPLACE INTO engines VALUES(?,?)",(account,json.dumps(s,allow_nan=False)))
         db.commit()
     finally:
@@ -271,7 +303,7 @@ def status(account:str,cfg=Depends(control)):
     with state(account,cfg) as s:
         rollover(s,now)
         daily,dd=risk(s,now)
-        return dict(paper_mode=True,profile=s["profile"],config=s["config"],balance=s["balance"],equity=equity(s),
+        return dict(paper_mode=True,broker_execution_requested=bool(s.get("registration",{}).get("enabled")),profile=s["profile"],config=s["config"],balance=s["balance"],equity=equity(s),
                     floating_pnl=equity(s)-s["balance"],daily_loss_pct=daily,drawdown_pct=dd,locked=s["locked"],
                     news_pause=calendar_pause(s,now),positions=s["positions"],
                     quote_times={k:v["timestamp"] for k,v in s["quotes"].items()})
@@ -377,7 +409,7 @@ def update_bias(account:str,symbol:str,bars:HistoryBars,cfg=Depends(feed)):
 
 
 @app.get("/market-bias")
-def market_bias(account:str,cfg=Depends(control)):
+def market_bias(account:str,cfg=Depends(signals)):
     with state(account,cfg) as s:
         result={}
         for symbol in {v["symbol"] for v in s["config"]["setups"]}:
@@ -388,7 +420,7 @@ def market_bias(account:str,cfg=Depends(control)):
 
 
 @app.get("/accounts/{account}/alerts")
-def alerts(account:str,cfg=Depends(control)):
+def alerts(account:str,cfg=Depends(signals)):
     with state(account,cfg) as s: return s.get("alerts",[])
 
 
@@ -410,3 +442,55 @@ def feed_config(account:str,cfg=Depends(feed)):
     with state(account,cfg) as s:
         c=s["config"]
         return {"symbols":sorted({v["symbol"] for v in c["setups"]}),"currency":c.get("account_currency")}
+
+class Registration(Payload):
+    mt5_account_id:str
+    mt5_server:str
+    risk_mode:Literal["percent","fixed_usd"]
+    risk_value:float=Field(gt=0)
+    daily_loss_cap:float=Field(gt=0)
+    max_dd_cap:float=Field(gt=0,le=7.5)
+    demo_live_execution:bool=False
+
+
+@app.post("/ea/register-and-start")
+def register_ea(data:Registration,authorization:str=Header(default=""),x_device_id:str=Header(default="")):
+    from mt5_live_adapter import real_allowed
+    r=licenses.licensed(authorization,x_device_id,"EA_ONLY")
+    if (data.mt5_account_id,data.mt5_server)!=(r["login"],r["server"]):
+        raise HTTPException(403,"Bound MT5 account mismatch")
+    if data.demo_live_execution and "demo" not in data.mt5_server.lower() and not real_allowed():
+        raise HTTPException(403,"Demo server required")
+    cfg=json.loads(os.getenv("PAPER_ACCOUNTS_JSON","{}")).get(r["account"])
+    if not cfg: raise HTTPException(403,"Engine account unavailable")
+    with state(r["account"],cfg) as s:
+        c=s["config"]
+        if data.demo_live_execution and c.get("execution_mode")=="signal_only":
+            raise HTTPException(403,"Signal-only profile")
+        if s["locked"] or s["positions"]: raise HTTPException(409,"Engine locked or has open positions")
+        if data.risk_mode=="fixed_usd":
+            if c.get("account_currency")!="USD": raise HTTPException(422,"Fixed USD profile required")
+            c.update(risk_amount_usd=data.risk_value,daily_loss_cap_usd=data.daily_loss_cap)
+        else:
+            if data.risk_value>.75 or data.daily_loss_cap>2.5 or "risk_amount_usd" in c:
+                raise HTTPException(422,"Invalid percentage limits or profile")
+            c.update(risk_pct=data.risk_value,daily_loss_cap_pct=data.daily_loss_cap)
+        c.update(max_dd_cap_pct=data.max_dd_cap,max_drawdown_cap_pct=data.max_dd_cap)
+        s["registration"]=dict(license_id=r["id"],generation=r["generation"],login=r["login"],server=r["server"],
+                               enabled=data.demo_live_execution,started=time.time())
+    return {"account":r["account"],"mode":"broker_requested" if data.demo_live_execution else "paper",
+            "requires_connected_bridge":data.demo_live_execution}
+
+
+@app.get("/accounts/{account}/execution-plan")
+def execution_plan(account:str,cfg=Depends(feed)):
+    with state(account,cfg) as s:
+        reg=s.get("registration")
+        if not reg: return {"registered":False}
+        with sqlite3.connect(os.getenv("PAPER_STATE_DB",ROOT/"paper_state.db")) as db:
+            valid=db.execute("""SELECT 1 FROM mobile_license WHERE id=? AND generation=? AND NOT revoked
+                AND (expires IS NULL OR expires>?) AND account=? AND login=? AND server=?""",
+                (reg["license_id"],reg["generation"],time.time(),account,reg["login"],reg["server"])).fetchone()
+        enabled=bool(valid and reg["enabled"] and not s["locked"])
+        return {"registered":True,"enabled":enabled,"login":reg["login"],"server":reg["server"],
+                "positions":s["positions"] if enabled else [],"risk":s["config"]}
