@@ -1,9 +1,9 @@
 {
   "version": 1,
-  "mode": "research",
+  "mode": "paper",
   "risk_pct": 0.5,
-  "daily_loss_cap_pct": 2.0,
-  "max_drawdown_cap_pct": 10.0,
+  "daily_loss_cap_pct": 2.5,
+  "max_drawdown_cap_pct": 7.5,
   "max_open": 2,
   "max_per_strategy": 1,
   "max_per_symbol": 1,
@@ -66,6 +66,9 @@
     "Session ORB": "M5",
     "EMA VWAP": "M15"
   },
-  "daily_loss_basis": "realized_equity_at_UTC_day_start",
-  "drawdown_basis": "realized_equity_high_water_mark"
+  "daily_loss_basis": "floating_equity_at_UTC_day_start",
+  "drawdown_basis": "floating_equity_high_water_mark",
+  "paper_mode": true,
+  "profile": "prop_firm_core",
+  "max_dd_cap_pct": 7.5
 }

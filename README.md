@@ -117,3 +117,38 @@ Run `python -m pytest`. Tests use synthetic fixtures and temporary SQLite storag
 By default, `research_lab.py` writes approval candidates to `<output-dir>/approved_candidates.json`. Use `--approved-path` to explicitly select a different destination.
 
 Run `python evaluate_deterministic.py` to evaluate the rolling ORB and EMA pullback strategies across both historical M15 CSV directories. It prints JSON lines per file, strategy, and cost scenario, including drawdown and trade durations in bars. Use `--pattern` and `--since` to limit the run.
+
+## Mobile paper account control
+
+Run the paper API with `python -m uvicorn paper_control:app --host 127.0.0.1 --port 8010`. Its OpenAPI schema is at `/openapi.json`. Use HTTPS through the deployment reverse proxy for mobile access. The control service uses its own paper database and has no order-sending broker adapter.
+
+Set `PAPER_ACCOUNTS_JSON` in the server environment. Each key is a mobile account identifier. For example:
+
+```json
+{"desk1":{"profile":"prop_firm_core","starting_balance":100000,"control_token_env":"DESK1_MOBILE_TOKEN","feed_token_env":"DESK1_FEED_TOKEN"}}
+```
+
+Set the two referenced variables to different private bearer tokens. Each account and role requires a unique token. The initial template is `three_setup_portfolio.json`. Future profiles can specify a separate `config` path with a matching profile name and paper mode enabled. State, locks, fills and setting overrides persist by account in SQLite. Set `PAPER_STATE_DB` to override the database path. Later template edits apply to newly provisioned accounts. PATCH updates apply to existing accounts immediately.
+
+Run one market-data process per account/terminal:
+
+```powershell
+python paper_mt5_bridge.py --account desk1 --terminal "C:\path\terminal64.exe" --login DEMO_LOGIN --server DEMO_SERVER --feed-token-env DESK1_FEED_TOKEN
+```
+
+Use separate terminal instances for different broker logins. The bridge checks the login and server, polls for changed ticks every 250 ms, and periodically sends closed MT5 bars. AI calls run outside the tick-processing and SQLite risk transactions. With no usable LLM response, the bias endpoint still returns deterministic alignment and sets AI commentary to null. Session levels use observed M15 candles during fixed UTC Asia 00–06, London 07–13 and NY 13–17 windows. The terminal supplies the H4 and daily candle boundaries.
+
+| Role | Request | Purpose |
+|---|---|---|
+| Mobile | GET /accounts/{account}/status | Equity, balance, floating P&L, quote timestamps, positions, locks, configuration and news status |
+| Mobile | GET /accounts/{account}/history | Closed paper trades and exit reasons |
+| Mobile | GET /market-bias?account={account} | Direction, completed H4/D1 EMA alignment, liquidity levels and optional AI commentary |
+| Mobile | PATCH /accounts/{account}/settings | Update risk_pct, daily_loss_cap_pct, max_dd_cap_pct and/or setups (symbol, strategy, enabled) |
+| Mobile | POST /accounts/{account}/commands/FLATTEN_ALL_AND_PAUSE | Close paper positions at their latest stored liquidation quotes and persist an emergency lock |
+| Feed | POST /accounts/{account}/calendar | Supply covered UTC epoch start/end and events with timestamp, currency and impact |
+| Feed | POST /accounts/{account}/paper-intents | Submit an upstream strategy-confirmed id, symbol, strategy, side, stop and target |
+| Feed | POST /accounts/{account}/quotes or /accounts/{account}/bars/{symbol} | Publish verified broker quote/specification or closed market history |
+
+Send `Authorization: Bearer <account-role-token>`. Calendar coverage must include the entire ±15-minute guard interval, even on days without events. The deployment must supply the economic-calendar source and strategy-confirmed intents. The core enforces bias, sessions, size, caps, duplicate protection and protective exits. Strategy-specific partial exits/trailing and broker-specific fees are not modeled by the paper fill adapter.
+
+Daily loss uses the account's first UTC-day opening equity reference, carried from its last known marks. Total drawdown uses peak marked equity. New quotes synchronously mark positions and check both limits. An outage prevents fresh valuation and stale required quotes block entries. Flattening uses last-known marks and records their timestamps. Daily locks clear on the next UTC day; emergency and total-drawdown locks persist. Default caps are 2.5% daily and 7.5% total.

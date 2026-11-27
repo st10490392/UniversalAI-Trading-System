@@ -14,3 +14,5 @@ data/research_2020_2025/
 data/research_audit_2026_11/
 approved_strategies.json
 logs/
+
+paper_state.db*
