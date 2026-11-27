@@ -1,0 +1,71 @@
+{
+  "version": 1,
+  "mode": "research",
+  "risk_pct": 0.5,
+  "daily_loss_cap_pct": 2.0,
+  "max_drawdown_cap_pct": 10.0,
+  "max_open": 2,
+  "max_per_strategy": 1,
+  "max_per_symbol": 1,
+  "setups": [
+    {
+      "symbol": "XAUUSD",
+      "strategy": "Session ORB",
+      "enabled": true,
+      "entry_utc": [
+        "07:00",
+        "17:00"
+      ],
+      "oos_fold_profiles": [
+        "be/30m",
+        "1.5R/15m"
+      ],
+      "profile": "1.5R/15m",
+      "max_trades_per_session": 1
+    },
+    {
+      "symbol": "XAUUSD",
+      "strategy": "EMA VWAP",
+      "enabled": true,
+      "entry_utc": [
+        "07:00",
+        "17:00"
+      ],
+      "oos_fold_profiles": [
+        "partialtrail",
+        "partialtrail"
+      ],
+      "profile": "partialtrail",
+      "max_trades_per_session": 1
+    },
+    {
+      "symbol": "Germany 40",
+      "strategy": "EMA VWAP",
+      "enabled": true,
+      "entry_utc": [
+        "07:00",
+        "15:30"
+      ],
+      "oos_fold_profiles": [
+        "2R",
+        "2R"
+      ],
+      "profile": "2R",
+      "max_trades_per_session": 1
+    }
+  ],
+  "timezone": "UTC",
+  "bias": {
+    "completed_bars_only": true,
+    "require_agreement": {
+      "H4": 50,
+      "D1": 20
+    }
+  },
+  "signal_timeframes": {
+    "Session ORB": "M5",
+    "EMA VWAP": "M15"
+  },
+  "daily_loss_basis": "realized_equity_at_UTC_day_start",
+  "drawdown_basis": "realized_equity_high_water_mark"
+}
