@@ -1,0 +1,9 @@
+# Deriv synthetic-index walk-forward research
+
+Run `python export_deriv_demo.py --terminal "<terminal64.exe path>"` from this worktree, then `python synthetic_walkforward.py`. The exporter verifies a connected USD Deriv demo account, pages backward through native completed M5/M15/H1 bars and writes one CSV per symbol/timeframe to data/deriv_demo/. Export-time tick values, lot grids and a modeled commission schedule are estimates for historical fills.
+
+Both deterministic signals use M15 closes with completed H1 close relative to EMA200. EMA-VWAP requires a previous EMA20 touch, a close beyond the prior extreme, EMA20/50 alignment and agreement with tick-volume VWAP anchored at UTC midnight. Volatility Breakout requires a close outside the preceding 20-bar range and ATR14/ATR50 > 1.05. Both sides trade around the clock. Next contiguous M5 open, 1.5 M15 ATR stop anchored to signal close, 2.5R/3R target, 96 M5 bar timeout. Stop first on ambiguous candles. No concurrent positions within each tested setup.
+
+Start equity $10,000; $5 modeled loss budget including stop distance, exit slippage and round-trip commission (gaps may exceed budget), rounded down to broker volume step, skip if below minimum. Pause after $20 realized daily loss until next UTC day. Baseline uses observed/causal spread, 2 points slippage per side, $7 commission per lot round trip; stress uses twice the spread, 5 points and $10.50 per lot. Unrealized drawdown, latency, changing broker specifications and historical commission changes are not modeled.
+
+Two rolling-origin OOS folds cover the final two fifths of observed M5 trading dates. The preceding fifth selects the target, prioritizing at least ten validation trades, then stressed expectancy. The same standard qualification thresholds apply without retuning: 50+ trades in both scenarios, positive expectancy in both, stressed PF >=1.15 and worst closed-equity DD <=20%. CSV includes each fold and pooled result.
